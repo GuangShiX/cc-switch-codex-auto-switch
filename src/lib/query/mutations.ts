@@ -377,6 +377,11 @@ export const useSwitchProviderMutation = (appId: AppId) => {
       );
     },
     onSettled: async () => {
+      if (appId === "codex") {
+        // A lost reply can happen after Enable commits. Re-read selection even
+        // when the request rejects; do not retry or infer an account switch.
+        await queryClient.invalidateQueries({ queryKey: ["providers", appId] });
+      }
       if (appId === "pi") {
         await invalidatePiProviderCaches(queryClient);
       }

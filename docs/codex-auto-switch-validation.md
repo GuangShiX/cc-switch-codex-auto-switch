@@ -16,6 +16,12 @@
 
 这些检查不能证明远端账号仍有效、真实耗尽触发已执行，或任何机器都兼容桌面恢复协议。
 
+### 后续界面同步修复
+
+手动启用曾等整个桌面重开、恢复流程结束才刷新当前账号，因此后台已切到新账号时，旧账号卡片仍可能显示“重开 Codex”。当前主分支改为原生启用提交后立即通知界面；界面收到通知后读取后台实际选择，延迟的旧事件不会把用户的新选择改回去。桌面重开失败或请求回复不明确时也重新读取选择。十秒元数据轮询作为补充，不查询额度或刷新登录令牌；隐藏的 WebView 可能暂停该界面轮询，原生后台监测独立运行。
+
+新增 5 个相关回归覆盖即时刷新、延迟事件、跨页面更新、重开失败及旧卡片按钮恢复。两份对应测试共 23 项通过，发布副本的 8 份相关前端测试共 79 项通过，TypeScript、前端构建和手动原生启用的 2 项回归通过。本次界面修复未替换已安装程序，也未执行真实切号或桌面重启。
+
 ## 安装验证
 
 在 Windows 本机替换程序后，确认修改版 CC Switch 独立运行，原有托管账号、供应商绑定及列表顺序保留，数据库检查正常。安装前保留了本地回滚备份，未清空数据库或恢复旧登录令牌。
@@ -57,7 +63,7 @@
 ```sh
 pnpm install --frozen-lockfile
 pnpm typecheck
-pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/lib/forkUpdater.test.ts
+pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/lib/forkUpdater.test.ts tests/integration/App.test.tsx
 pnpm build:renderer
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib services::codex_
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib codex_oauth_auth

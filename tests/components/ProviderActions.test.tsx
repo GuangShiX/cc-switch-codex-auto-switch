@@ -4,6 +4,29 @@ import { describe, expect, it, vi } from "vitest";
 import { ProviderActions } from "@/components/providers/ProviderActions";
 
 describe("ProviderActions current provider retry", () => {
+  it("changes the old Codex account back to Enable after selection changes", async () => {
+    const onSwitch = vi.fn();
+    const props = {
+      appId: "codex" as const,
+      onSwitch,
+      onEdit: vi.fn(),
+      onDelete: vi.fn(),
+    };
+    const { rerender } = render(<ProviderActions {...props} isCurrent />);
+    expect(screen.getByRole("button", { name: "重开 Codex" })).toBeEnabled();
+
+    rerender(<ProviderActions {...props} isCurrent={false} />);
+    expect(
+      screen.queryByRole("button", { name: "重开 Codex" }),
+    ).not.toBeInTheDocument();
+    const enableButton = screen.getByRole("button", {
+      name: "provider.enable",
+    });
+    expect(enableButton).toBeEnabled();
+    await userEvent.setup().click(enableButton);
+    expect(onSwitch).toHaveBeenCalledTimes(1);
+  });
+
   it("lets the current Codex provider restart through the existing switch action", async () => {
     const user = userEvent.setup();
     const onSwitch = vi.fn();
@@ -36,7 +59,9 @@ describe("ProviderActions current provider retry", () => {
       />,
     );
 
-    const currentButton = screen.getByRole("button", { name: "provider.inUse" });
+    const currentButton = screen.getByRole("button", {
+      name: "provider.inUse",
+    });
     expect(currentButton).toBeDisabled();
     await user.click(currentButton);
     expect(onSwitch).not.toHaveBeenCalled();
@@ -56,7 +81,9 @@ describe("ProviderActions current provider retry", () => {
       />,
     );
 
-    const currentButton = screen.getByRole("button", { name: "provider.inUse" });
+    const currentButton = screen.getByRole("button", {
+      name: "provider.inUse",
+    });
     expect(currentButton).toBeDisabled();
     await user.click(currentButton);
     expect(onSwitch).not.toHaveBeenCalled();

@@ -64,6 +64,7 @@ jobs:
           tests/hooks/useProviderActions.test.tsx
           tests/hooks/useDragSort.test.tsx
           tests/lib/forkUpdater.test.ts
+          tests/integration/App.test.tsx
 
       - name: Build frontend resources
         run: pnpm build:renderer

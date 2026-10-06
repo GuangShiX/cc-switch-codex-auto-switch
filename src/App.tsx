@@ -415,38 +415,16 @@ function App() {
     });
   };
 
-  useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
-    let active = true;
-
-    const setupListener = async () => {
-      try {
-        const off = await providersApi.onSwitched(
-          async (event: ProviderSwitchEvent) => {
-            if (event.appType === activeApp) {
-              await refetch();
-            }
-            if (event.appType === "pi") {
-              await invalidatePiProviderCaches(queryClient);
-            }
-          },
-        );
-        if (!active) {
-          off();
-          return;
-        }
-        unsubscribe = off;
-      } catch (error) {
-        console.error("[App] Failed to subscribe provider switch event", error);
-      }
-    };
-
-    void setupListener();
-    return () => {
-      active = false;
-      unsubscribe?.();
-    };
-  }, [activeApp, queryClient, refetch]);
+  useTauriEvent<ProviderSwitchEvent>("provider-switched", async (event) => {
+    // Read the authoritative selection; a delayed event's providerId must not
+    // roll the UI back after the user has already selected another account.
+    await queryClient.invalidateQueries({
+      queryKey: ["providers", event.appType],
+    });
+    if (event.appType === "pi") {
+      await invalidatePiProviderCaches(queryClient);
+    }
+  });
 
   useTauriEvent("universal-provider-synced", async () => {
     await queryClient.invalidateQueries({ queryKey: ["providers"] });
@@ -463,8 +441,9 @@ function App() {
     error: string | null;
   }>(
     "codex-desktop-restart-result",
-    ({ accountActivated, restarted, error }) => {
+    async ({ accountActivated, restarted, error }) => {
       if (!accountActivated) return;
+      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
       if (error) {
         toast.warning(
           t("notifications.codexDesktopRestartFailed", {

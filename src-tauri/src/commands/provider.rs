@@ -222,6 +222,15 @@ pub async fn switch_provider(
     };
 
     if let Some(generation) = generation {
+        // Enable has committed before the desktop lifecycle begins. Notify the
+        // renderer now so the previous account no longer appears current while
+        // restart/recovery is still running or waiting for an acknowledgement.
+        if let Err(error) = app_handle.emit(
+            "provider-switched",
+            serde_json::json!({"appType": "codex", "providerId": selected_id}),
+        ) {
+            log::warn!("Codex activation event failed: {error}");
+        }
         // Explicit Enable also retries the current account's desktop flow:
         // activation may have succeeded while a prior restart did not. The
         // committed selection remains successful if this follow-up fails.

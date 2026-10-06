@@ -62,9 +62,10 @@ export const useProvidersQuery = (
   return useQuery({
     queryKey: ["providers", appId],
     placeholderData: keepPreviousData,
-    // 当代理服务运行时，每 10 秒刷新一次供应商列表
-    // 这样可以自动反映后端熔断器自动禁用代理目标的变更
-    refetchInterval: isProxyRunning ? 10000 : false,
+    // Codex account selection can change in the native process while the
+    // renderer is hidden or misses an event. This reads provider metadata only;
+    // it does not query quota or refresh managed-account credentials.
+    refetchInterval: isProxyRunning || appId === "codex" ? 10000 : false,
     queryFn: async () => {
       let providers: Record<string, Provider> = {};
       let currentProviderId = "";

@@ -1,9 +1,15 @@
 import { Suspense, type ComponentType } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, fireEvent } from "@testing-library/react";
+import {
+  render,
+  screen,
+  waitFor,
+  fireEvent,
+  act,
+} from "@testing-library/react";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { http, HttpResponse } from "msw";
-import { providersApi } from "@/lib/api/providers";
+import { providersApi, type SwitchResult } from "@/lib/api/providers";
 import {
   resetProviderState,
   setCurrentProviderId,
@@ -15,6 +21,7 @@ import { server } from "../msw/server";
 
 const toastSuccessMock = vi.fn();
 const toastErrorMock = vi.fn();
+const toastWarningMock = vi.fn();
 const skillsPanelMocks = vi.hoisted(() => ({
   checkUpdates: vi.fn(),
   openDiscovery: vi.fn(),
@@ -24,6 +31,7 @@ vi.mock("sonner", () => ({
   toast: {
     success: (...args: unknown[]) => toastSuccessMock(...args),
     error: (...args: unknown[]) => toastErrorMock(...args),
+    warning: (...args: unknown[]) => toastWarningMock(...args),
   },
 }));
 
@@ -46,6 +54,11 @@ vi.mock("@/components/providers/ProviderList", () => ({
       <button onClick={() => onSwitch(providers[currentProviderId])}>
         switch
       </button>
+      {providers["codex-2"] && (
+        <button onClick={() => onSwitch(providers["codex-2"])}>
+          switch-secondary-provider
+        </button>
+      )}
       <button onClick={() => onEdit(providers[currentProviderId])}>edit</button>
       <button onClick={() => onDuplicate(providers[currentProviderId])}>
         duplicate
@@ -186,8 +199,7 @@ vi.mock("@/components/mcp/McpPanel", () => ({
     ),
 }));
 
-const renderApp = (AppComponent: ComponentType) => {
-  const client = new QueryClient();
+const renderApp = (AppComponent: ComponentType, client = new QueryClient()) => {
   return render(
     <QueryClientProvider client={client}>
       <Suspense fallback={<div data-testid="loading">loading</div>}>
@@ -202,10 +214,152 @@ describe("App integration with MSW", () => {
     resetProviderState();
     toastSuccessMock.mockReset();
     toastErrorMock.mockReset();
+    toastWarningMock.mockReset();
     skillsPanelMocks.checkUpdates.mockReset();
     skillsPanelMocks.openDiscovery.mockReset();
     localStorage.removeItem("cc-switch-last-view");
     localStorage.removeItem("cc-switch-last-app");
+  });
+
+  it("reflects native activation before the desktop lifecycle returns", async () => {
+    localStorage.setItem("cc-switch-last-app", "codex");
+    let finishSwitch!: (result: SwitchResult) => void;
+    const switchSpy = vi.spyOn(providersApi, "switch").mockImplementationOnce(
+      () =>
+        new Promise<SwitchResult>((resolve) => {
+          finishSwitch = resolve;
+        }),
+    );
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    try {
+      await waitFor(() =>
+        expect(screen.getByTestId("current-provider")).toHaveTextContent(
+          "codex-1",
+        ),
+      );
+      fireEvent.click(screen.getByText("switch-secondary-provider"));
+      await waitFor(() =>
+        expect(switchSpy).toHaveBeenCalledWith("codex-2", "codex"),
+      );
+
+      setCurrentProviderId("codex", "codex-2");
+      act(() => {
+        emitTauriEvent("provider-switched", {
+          appType: "codex",
+          providerId: "codex-2",
+        });
+      });
+      await waitFor(() =>
+        expect(screen.getByTestId("current-provider")).toHaveTextContent(
+          "codex-2",
+        ),
+      );
+      expect(toastSuccessMock).not.toHaveBeenCalled();
+    } finally {
+      await act(async () => {
+        finishSwitch?.({ warnings: [], desktopRestarted: true });
+      });
+      switchSpy.mockRestore();
+    }
+  }, 10_000);
+
+  it("reconciles a delayed switch event against the user's newer selection", async () => {
+    localStorage.setItem("cc-switch-last-app", "codex");
+    setCurrentProviderId("codex", "codex-2");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-2",
+      ),
+    );
+    setCurrentProviderId("codex", "codex-1");
+    act(() => {
+      emitTauriEvent("provider-switched", {
+        appType: "codex",
+        providerId: "codex-2",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-1",
+      ),
+    );
+  });
+
+  it("invalidates the switched app's cache while another app is visible", async () => {
+    const client = new QueryClient();
+    client.setQueryData(["providers", "codex"], {
+      providers: {},
+      currentProviderId: "codex-1",
+    });
+    const { default: App } = await import("@/App");
+    renderApp(App, client);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "claude-1",
+      ),
+    );
+    expect(client.getQueryState(["providers", "codex"])?.isInvalidated).toBe(
+      false,
+    );
+    setCurrentProviderId("codex", "codex-2");
+    act(() => {
+      emitTauriEvent("provider-switched", {
+        appType: "codex",
+        providerId: "codex-2",
+      });
+    });
+    await waitFor(() =>
+      expect(client.getQueryState(["providers", "codex"])?.isInvalidated).toBe(
+        true,
+      ),
+    );
+    expect(screen.getByTestId("current-provider")).toHaveTextContent(
+      "claude-1",
+    );
+
+    fireEvent.click(screen.getByText("switch-codex"));
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-2",
+      ),
+    );
+  });
+
+  it("refreshes the activated account even when the desktop restart fails", async () => {
+    localStorage.setItem("cc-switch-last-app", "codex");
+    const { default: App } = await import("@/App");
+    renderApp(App);
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-1",
+      ),
+    );
+
+    setCurrentProviderId("codex", "codex-2");
+    act(() => {
+      emitTauriEvent("codex-desktop-restart-result", {
+        accountActivated: true,
+        restarted: false,
+        error: "synthetic restart failure",
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "codex-2",
+      ),
+    );
+    await waitFor(() =>
+      expect(toastWarningMock).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ description: "synthetic restart failure" }),
+      ),
+    );
   });
 
   it("covers basic provider flows via real hooks", async () => {
