@@ -63,6 +63,7 @@ jobs:
           tests/components/ProviderActions.test.tsx
           tests/hooks/useProviderActions.test.tsx
           tests/hooks/useDragSort.test.tsx
+          tests/hooks/useUsageCacheBridge.test.tsx
           tests/lib/forkUpdater.test.ts
           tests/integration/App.test.tsx
 

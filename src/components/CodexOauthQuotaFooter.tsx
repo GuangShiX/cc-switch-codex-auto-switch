@@ -55,13 +55,20 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
   }
 
   return (
-    <SubscriptionQuotaView
-      quota={quota}
-      loading={loading}
-      refetch={refetch}
-      appIdForExpiredHint="codex_oauth"
-      inline={inline}
-    />
+    <div className={inline ? "inline-flex items-center gap-1" : undefined}>
+      {quota?.success ? (
+        <span className="text-xs text-muted-foreground">
+          {t("codexAutoSwitch.quotaUsed", "已用")}
+        </span>
+      ) : null}
+      <SubscriptionQuotaView
+        quota={quota}
+        loading={loading}
+        refetch={refetch}
+        appIdForExpiredHint="codex_oauth"
+        inline={inline}
+      />
+    </div>
   );
 };
 

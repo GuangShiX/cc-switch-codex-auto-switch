@@ -10,7 +10,7 @@ const PHASE_LABELS: Record<string, string> = {
   waiting: "等待可用账号",
   monitoring: "正在后台监测",
   checking: "正在查询当前账号额度",
-  selecting: "正在按列表顺序查询候选账号",
+  selecting: "正在选择 5 小时剩余额度最多的账号",
   preflight: "正在核对账号和桌面任务",
   pausing: "正在安全暂停任务",
   closing: "正在关闭 Codex 桌面",
@@ -68,7 +68,7 @@ export function CodexAutoSwitchPanel({
       <p className="text-xs leading-relaxed text-muted-foreground">
         {t(
           "codexAutoSwitch.thresholds",
-          "5 小时剩余额度严格低于 5%，或周剩余额度为 0% 时触发。5 小时恰好 5%、周剩余 1% 仍可使用。按 Codex 账号列表从上到下查询，跳过当前账号，使用第一个可用账号。",
+          "当前账号 5 小时剩余额度严格低于 5%，或周剩余额度为 0% 时触发。候选账号 5 小时剩余必须大于 5%，周剩余必须大于 0%。优先选择 5 小时剩余额度最多的账号，额度相同时按列表顺序。",
         )}
       </p>
       <p className="text-xs text-muted-foreground">
@@ -80,7 +80,7 @@ export function CodexAutoSwitchPanel({
       <p className="text-xs leading-relaxed text-muted-foreground">
         {t(
           "codexAutoSwitch.lifecycle",
-          "切号时正常关闭并重开 Codex 桌面，再恢复本次暂停的原任务。用户手动停止、等待审批和已完成的任务不会自动继续。关闭自动开关不影响手动启用账号。",
+          "切号时正常关闭并重开 Codex 桌面，再恢复本次暂停或明确因额度耗尽停止的原任务。用户手动停止、等待审批和已完成的任务不会自动继续。关闭自动开关不影响手动启用账号。",
         )}
       </p>
 

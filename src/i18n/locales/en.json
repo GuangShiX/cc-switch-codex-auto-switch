@@ -2,7 +2,8 @@
   "codexAutoSwitch": {
     "title": "Codex desktop account switching",
     "enable": "Automatic account switching",
-    "thresholds": "Switch when the 5-hour quota remaining is strictly below 5%, or the weekly quota remaining is 0%. Exactly 5% in the 5-hour window and 1% weekly remain usable. Check the Codex account list from top to bottom, skip the current account, and use the first available account.",
+    "quotaUsed": "Used",
+    "thresholds": "Switch when the current account has strictly less than 5% of its 5-hour quota remaining, or no weekly quota. Candidates must have more than 5% of their 5-hour quota and more than 0% weekly remaining. Prefer the most remaining 5-hour quota; ties follow list order.",
     "background": "CC Switch checks quota in the background every 5 minutes, including while minimized or hidden in the tray. A locked desktop skips the switch; quota and account state are checked again after unlock.",
     "cancel": "Cancel this switch",
     "checkedAccount": "Account checked",
@@ -16,7 +17,7 @@
       "waiting": "Waiting for an available account",
       "monitoring": "Monitoring in the background",
       "checking": "Checking current account quota",
-      "selecting": "Checking candidates in list order",
+      "selecting": "Selecting the account with the most 5-hour quota remaining",
       "preflight": "Checking account and desktop task state",
       "pausing": "Safely pausing tasks",
       "closing": "Closing Codex desktop",
@@ -32,7 +33,7 @@
       "failed": "Failed",
       "disabled": "Automatic switching is off"
     },
-    "lifecycle": "Switching normally closes and reopens Codex, then resumes only tasks paused by this operation. Manually stopped, approval-waiting and completed tasks are not continued. Turning automatic switching off does not block manual activation."
+    "lifecycle": "Close and reopen the Codex desktop, then restore tasks paused by this switch or explicitly stopped by quota exhaustion. Manually stopped, approval-waiting and completed tasks are not continued. Disabling automatic switching does not block manual Enable."
   },
   "app": {
     "title": "CC Switch",

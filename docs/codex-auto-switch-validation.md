@@ -22,6 +22,18 @@
 
 新增 5 个相关回归覆盖即时刷新、延迟事件、跨页面更新、重开失败及旧卡片按钮恢复。两份对应测试共 23 项通过，发布副本的 8 份相关前端测试共 79 项通过，TypeScript、前端构建和手动原生启用的 2 项回归通过。本次界面修复未替换已安装程序，也未执行真实切号或桌面重启。
 
+### 额度耗尽恢复及候选规则调整
+
+后续现场日志记录过一次自动完整流程成功，之后另一次检查因额度失败任务被统一归入需处理状态而没有关闭桌面。桌面协议使用 `failed + error.codexErrorInfo=usageLimitExceeded` 表示额度耗尽，运行状态可能保留 `systemError`；这类无待审批、待输入或待提交的失败任务应与真正等待审批区分。
+
+主分支增加独立额度恢复票据，保留原失败轮次、终止时间、项目、模型和权限，不向已经失败的轮次发送暂停。只有可靠终止时间在捕获前 15 分钟内的额度失败会自动恢复；旧失败或时间不明确的聊天可正常关闭但保持停止，用户停止、完成、新轮次、其他错误和审批仍拒绝自动恢复。
+
+候选规则同时改为：5 小时剩余严格大于 5%，周剩余大于 0%；选择 5 小时剩余最多的账号，平手保留原顺序，完全未使用的窗口可停止继续查询。当前账号的切换触发仍为 5 小时剩余严格低于 5%，或周剩余为 0%。后台已有查询结果同步到额度卡片，不增加重复请求。桌面后续流程失败时，下次额度可用检查仍保留该失败提示。
+
+此部分在 2026-10-06 的源码检查完成：原生相关回归 93 项、手动启用回归 2 项通过，相关前端回归 81 项通过；随后额度显示与缓存的 6 项复验、发布副本相关 16 项复验通过，TypeScript 和嵌入前端的本机程序构建通过。已在同一本机替换 CC Switch 并启动，原供应商绑定、托管账号、当前选择和登录文件的安装前后核对一致，Codex 原进程未重启。
+
+此次安装验证没有真实切号，没有制造真实额度耗尽，也未现场复验新增的额度失败恢复票据。以上回归与安装结果不能当成这部分真实完整流程已通过；尚需后续真实耗尽场景核实。
+
 ## 安装验证
 
 在 Windows 本机替换程序后，确认修改版 CC Switch 独立运行，原有托管账号、供应商绑定及列表顺序保留，数据库检查正常。安装前保留了本地回滚备份，未清空数据库或恢复旧登录令牌。
@@ -63,7 +75,7 @@
 ```sh
 pnpm install --frozen-lockfile
 pnpm typecheck
-pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/lib/forkUpdater.test.ts tests/integration/App.test.tsx
+pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/hooks/useUsageCacheBridge.test.tsx tests/lib/forkUpdater.test.ts tests/integration/App.test.tsx
 pnpm build:renderer
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib services::codex_
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib codex_oauth_auth

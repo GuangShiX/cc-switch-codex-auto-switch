@@ -72,7 +72,10 @@ describe("CodexAutoSwitchPanel", () => {
       screen.getByRole("switch", { name: "自动换号开关" }),
     ).not.toBeChecked();
     expect(screen.getByText(/严格低于 5%/)).toHaveTextContent(
-      "5 小时恰好 5%、周剩余 1% 仍可使用",
+      "候选账号 5 小时剩余必须大于 5%",
+    );
+    expect(screen.getByText(/严格低于 5%/)).toHaveTextContent(
+      "优先选择 5 小时剩余额度最多的账号，额度相同时按列表顺序",
     );
     expect(screen.getByText(/CC Switch 每 5 分钟/)).toHaveTextContent(
       "锁屏时跳过本次切换，解锁后重新检查",

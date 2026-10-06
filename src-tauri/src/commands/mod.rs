@@ -3,7 +3,7 @@
 mod auth;
 mod balance;
 mod codex_oauth;
-pub(crate) use codex_oauth::query_codex_oauth_quota_for;
+pub(crate) use codex_oauth::{publish_codex_oauth_quota, query_codex_oauth_quota_for};
 mod coding_plan;
 mod config;
 mod copilot;

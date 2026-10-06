@@ -9,7 +9,7 @@ use crate::proxy::providers::codex_oauth_auth::CodexOAuthManager;
 use crate::services::model_fetch::FetchedModel;
 use crate::services::subscription::{query_codex_quota, CredentialStatus, SubscriptionQuota};
 use std::sync::Arc;
-use tauri::State;
+use tauri::{Emitter, State};
 
 /// Codex OAuth 认证状态
 ///
@@ -47,10 +47,30 @@ pub async fn get_codex_oauth_quota(
     // the request is in flight. Transport errors retain the last good snapshot;
     // authentication/HTTP failures replace it so the tray hides invalid quotas.
     if let Ok(quota) = &result {
-        app_state.usage_cache.put_codex_oauth(id, quota.clone());
-        crate::tray::schedule_tray_refresh(&app);
+        publish_codex_oauth_quota(&app, &app_state, &id, quota);
     }
     result
+}
+
+/// Publish the result of an existing quota request; never send another request.
+/// Native monitoring and account cards share the same cache and renderer event,
+/// including failures that must replace a stale successful display.
+pub(crate) fn publish_codex_oauth_quota(
+    app: &tauri::AppHandle,
+    state: &crate::store::AppState,
+    account_id: &str,
+    quota: &SubscriptionQuota,
+) {
+    state
+        .usage_cache
+        .put_codex_oauth(account_id.into(), quota.clone());
+    crate::tray::schedule_tray_refresh(app);
+    if let Err(error) = app.emit(
+        "codex-oauth-quota-updated",
+        serde_json::json!({"accountId": account_id, "quota": quota}),
+    ) {
+        log::debug!("Codex quota result event unavailable: {error}");
+    }
 }
 
 /// Native callers use the same managed-account token refresh and quota parser as

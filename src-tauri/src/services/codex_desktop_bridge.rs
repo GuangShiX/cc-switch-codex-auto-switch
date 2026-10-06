@@ -368,6 +368,7 @@ async fn run_lifecycle(
     };
     let desktop_receipt = restart::desktop_receipt()?;
     let desktop_running = desktop_receipt.is_some();
+    let mut ignored_quota_failures = 0usize;
     // A new explicit Enable may reopen a desktop left closed by a cancelled
     // flow. Its target identity must be checked even when none is running now.
     let expected_identity = target_identity(&app, &target).await?;
@@ -397,7 +398,19 @@ async fn run_lifecycle(
                 inventory.unresolved_thread_ids.len()
             ));
         }
-        if !inventory.running.is_empty() && expected_identity.is_none() {
+        let recent_quota_failures: Vec<_> = inventory
+            .quota_failed
+            .iter()
+            .filter(|task| task.recent_quota_failure())
+            .cloned()
+            .collect();
+        ignored_quota_failures = inventory.quota_failed.len() - recent_quota_failures.len();
+        if ignored_quota_failures > 0 {
+            log::info!("Codex recovery left {ignored_quota_failures} old or time-unconfirmed quota failures stopped");
+        }
+        if (!inventory.running.is_empty() || !recent_quota_failures.is_empty())
+            && expected_identity.is_none()
+        {
             return Err(
                 "当前供应商没有可核对的托管登录身份；账号启用不受影响，未暂停或自动恢复任务".into(),
             );
@@ -408,6 +421,27 @@ async fn run_lifecycle(
             session
                 .can_preserve_running_task(task)
                 .map_err(|e| format!("原聊天设置无法完整保存：{e}；未暂停任何任务"))?;
+        }
+        for task in &recent_quota_failures {
+            session
+                .can_preserve_quota_failed_task(task)
+                .map_err(|e| format!("额度耗尽聊天设置无法完整保存：{e}；未暂停任何任务"))?;
+        }
+        for task in recent_quota_failures {
+            check_selection(&app, generation, &source)?;
+            record.phase = format!("quota-recovery-intent:{}", task.thread_id);
+            record.planned_tasks.push(task.clone());
+            record.persist()?;
+            let ticket = session
+                .capture_quota_failed_task(&task, &record.operation_id, || {
+                    check_selection(&app, generation, &source).is_ok()
+                        && restart::ensure_same_desktop(&desktop_receipt).is_ok()
+                })
+                .await
+                .map_err(|e| format!("额度耗尽任务状态核对未完成：{e}；未继续关闭或换号"))?;
+            record.paused_tasks.push(ticket);
+            record.phase = "quota-recovery-captured".into();
+            record.persist()?;
         }
         for task in inventory.running {
             check_selection(&app, generation, &source)?;
@@ -454,13 +488,11 @@ async fn run_lifecycle(
             let actual = latest
                 .idle
                 .iter()
+                .chain(latest.quota_failed.iter())
                 .find(|task| task.thread_id == paused.thread_id)
-                .ok_or("本次暂停的原聊天状态未确认；未继续关闭桌面")?;
-            if actual.turn_id.as_deref() != Some(paused.turn_id.as_str())
-                || actual.status.as_deref() != Some("interrupted")
-                || actual.context != paused.context
-            {
-                return Err("本次暂停的原轮次、模型或权限已改变；旧恢复计划失效".into());
+                .ok_or("本次记录的原聊天状态未确认；未继续关闭桌面")?;
+            if !actual.matches_paused(paused) {
+                return Err("本次记录的原轮次、模型或权限已改变；旧恢复计划失效".into());
             }
         }
     }
@@ -597,7 +629,7 @@ async fn run_lifecycle(
             &app,
             generation,
             "resuming",
-            "正在恢复本次暂停的原聊天，沿用原模型和权限",
+            "正在恢复本次记录的原聊天，沿用原模型和权限",
         );
         for paused in record.paused_tasks.clone() {
             resume_guard()?;
@@ -621,7 +653,7 @@ async fn run_lifecycle(
                 &app,
                 generation,
                 "waiting-for-chat",
-                "正在等待原聊天加载并核对本次暂停的轮次，尚未发送继续",
+                "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
             );
             session
                 .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
@@ -631,7 +663,7 @@ async fn run_lifecycle(
                 &app,
                 generation,
                 "resuming",
-                "正在用原聊天恢复请求继续任务，保留本次暂停前的模型和权限",
+                "正在用原聊天恢复请求继续任务，保留本次换号前的模型和权限",
             );
             if let Some(expected) = expected_identity.as_ref() {
                 confirm_reopened_identity(expected, &resume_guard).await?;
@@ -677,14 +709,20 @@ async fn run_lifecycle(
     }
     record.phase = "completed".into();
     record.persist()?;
-    let message = if restarted {
+    let mut message = if restarted {
         format!(
-            "目标账号已启用，Codex 已正常重开；恢复本次暂停的 {} 个原任务",
+            "目标账号已启用，Codex 已正常重开；恢复本次记录的 {} 个原任务",
             record.resumed_tasks.len()
         )
     } else {
         "目标账号已启用；Codex 原本未运行，未额外启动桌面".into()
     };
+    if ignored_quota_failures > 0 {
+        message.push_str(&format!(
+            "；{} 个较早或结束时间未确认的额度失败任务未自动继续",
+            ignored_quota_failures
+        ));
+    }
     monitor::lifecycle_status(&app, generation, "completed", &message);
     Ok((restarted, message))
 }
@@ -713,12 +751,10 @@ fn validate_tasks_before_shutdown(
         let current = inventory
             .idle
             .iter()
+            .chain(inventory.quota_failed.iter())
             .find(|task| task.thread_id == saved.thread_id)
             .ok_or("正常退出前原聊天状态未确认；未关闭桌面")?;
-        if current.turn_id.as_deref() != Some(saved.turn_id.as_str())
-            || current.status.as_deref() != Some("interrupted")
-            || current.context != saved.context
-        {
+        if !current.matches_paused(saved) {
             return Err("正常退出前原轮次或权限已改变；旧恢复计划失效".into());
         }
     }
@@ -837,6 +873,46 @@ mod tests {
                 _ => inventory.idle[0].context.current_permissions = json!("user-new-permissions"),
             }
             assert!(validate_tasks_before_shutdown(&inventory, &[saved.clone()]).is_err());
+        }
+    }
+
+    #[test]
+    fn final_shutdown_accepts_exact_quota_failure_but_rejects_changed_recovery_intent() {
+        let mut original = original_task();
+        original.status = Some("failed".into());
+        original.runtime_status = "systemError".into();
+        original.turn_error_code = Some("usageLimitExceeded".into());
+        original.turn_ended_at_ms = Some(1_000);
+        let saved: PausedTask = serde_json::from_value(json!({
+            "threadId":original.thread_id, "turnId":original.turn_id,
+            "context":original.context,"pauseOperationId":"operation-A",
+            "confirmedByCcSwitch":false,"origin":"quotaExhausted"
+            ,"turnEndedAtMs":original.turn_ended_at_ms
+        }))
+        .unwrap();
+        let good = TaskInventory {
+            quota_failed: vec![original.clone()],
+            candidate_coverage_complete: true,
+            ..TaskInventory::default()
+        };
+        assert!(validate_tasks_before_shutdown(&good, &[saved.clone()]).is_ok());
+        for changed in 0..8 {
+            let mut inventory = good.clone();
+            let current = &mut inventory.quota_failed[0];
+            match changed {
+                0 => current.status = Some("interrupted".into()),
+                1 => current.status = Some("completed".into()),
+                2 => current.turn_id = Some("user-new-turn".into()),
+                3 => current.turn_error_code = None,
+                4 => current.waiting = true,
+                5 => current.runtime_status = "active".into(),
+                6 => current.context.model = Some("user-new-model".into()),
+                _ => current.context.current_permissions = json!("changed-permissions"),
+            }
+            assert!(
+                validate_tasks_before_shutdown(&inventory, &[saved.clone()]).is_err(),
+                "case {changed}"
+            );
         }
     }
 }

@@ -27,6 +27,28 @@ type UsageCacheUpdatedPayload =
 export function useUsageCacheBridge() {
   const queryClient = useQueryClient();
 
+  useTauriEvent<{ accountId: string; quota: SubscriptionQuota }>(
+    "codex-oauth-quota-updated",
+    ({ accountId, quota }) => {
+      if (!accountId) return;
+      queryClient.setQueryData<SubscriptionQuota>(
+        ["codex_oauth", "quota", accountId],
+        (current) => {
+          // Native candidate checks already queried this account. Display that
+          // result without a second request, and ignore late older samples.
+          if (
+            current?.queriedAt != null &&
+            quota.queriedAt != null &&
+            current.queriedAt > quota.queriedAt
+          ) {
+            return current;
+          }
+          return quota;
+        },
+      );
+    },
+  );
+
   useTauriEvent<UsageCacheUpdatedPayload>("usage-cache-updated", (payload) => {
     if (payload.kind === "script") {
       queryClient.setQueryData<UsageResult>(

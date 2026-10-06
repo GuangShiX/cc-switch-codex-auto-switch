@@ -25,6 +25,7 @@ const OWNER_REFOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDED_READ_SLICE: Duration = Duration::from_millis(500);
 const MAX_CANDIDATES: usize = 5000;
 const RESUME_TEXT: &str = "[CC Switch：恢复原任务] 本次换号前由 CC Switch 暂停了此任务，现已重开桌面。请检查中断现场和最后一次工具调用，继续此前尚未完成的原任务；保留原项目、模型和权限。结果不明确的操作先核对状态，不重复已完成的操作，原有审批仍需按规则处理。";
+const QUOTA_RESUME_TEXT: &str = "[CC Switch：恢复原任务] 此任务因账号额度耗尽而停止，CC Switch 已完成换号并重开桌面。请检查中断现场和最后一次工具调用，继续此前尚未完成的原任务；保留原项目、模型和权限。结果不明确的操作先核对状态，不重复已完成的操作，原有审批仍需按规则处理。";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +92,11 @@ pub struct TaskSnapshot {
     pub owner: String,
     pub turn_id: Option<String>,
     pub status: Option<String>,
+    /// Exact supported error enum only; never a server error message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ended_at_ms: Option<i64>,
     pub runtime_status: String,
     pub waiting: bool,
     pub is_child: bool,
@@ -115,16 +121,65 @@ impl TaskSnapshot {
             && !self.waiting
     }
 
-    fn matches_paused(&self, paused: &PausedTask) -> bool {
+    pub fn safely_quota_failed(&self) -> bool {
+        self.status.as_deref() == Some("failed")
+            && self.turn_error_code.as_deref() == Some("usageLimitExceeded")
+            && matches!(
+                self.runtime_status.as_str(),
+                "idle" | "notLoaded" | "systemError"
+            )
+            && self.turn_id.is_some()
+            && !self.waiting
+            && !self.is_child
+            && !self.ephemeral
+    }
+
+    /// Old quota errors are safe to leave stopped while restarting, but they
+    /// are not permission to resume a task the user abandoned earlier.
+    pub fn recent_quota_failure(&self) -> bool {
+        wall_clock_ms().is_some_and(|now| self.recent_quota_failure_at(now))
+    }
+
+    fn recent_quota_failure_at(&self, now_ms: i64) -> bool {
+        self.safely_quota_failed()
+            && self
+                .turn_ended_at_ms
+                .and_then(|ended| now_ms.checked_sub(ended))
+                .is_some_and(|age| (-5_000..=15 * 60 * 1_000).contains(&age))
+    }
+
+    fn matches_recovery_origin(&self, paused: &PausedTask) -> bool {
+        match paused.origin {
+            RecoveryOrigin::CcSwitchPause => {
+                paused.confirmed_by_cc_switch
+                    && self.status.as_deref() == Some("interrupted")
+                    && self.safely_idle()
+            }
+            RecoveryOrigin::QuotaExhausted => {
+                !paused.confirmed_by_cc_switch
+                    && self.safely_quota_failed()
+                    && paused.turn_ended_at_ms.is_some()
+                    && self.turn_ended_at_ms == paused.turn_ended_at_ms
+            }
+        }
+    }
+
+    pub fn matches_paused(&self, paused: &PausedTask) -> bool {
         self.thread_id == paused.thread_id
             && self.turn_id.as_deref() == Some(paused.turn_id.as_str())
-            && self.status.as_deref() == Some("interrupted")
-            && self.safely_idle()
+            && self.matches_recovery_origin(paused)
             && !self.is_child
             && !self.ephemeral
             && self.context == paused.context
-            && paused.confirmed_by_cc_switch
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryOrigin {
+    #[default]
+    CcSwitchPause,
+    QuotaExhausted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +190,10 @@ pub struct PausedTask {
     pub context: TaskContext,
     pub pause_operation_id: String,
     confirmed_by_cc_switch: bool,
+    #[serde(default)]
+    pub origin: RecoveryOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_ended_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_settings: Option<SavedTaskSettings>,
 }
@@ -162,6 +221,8 @@ pub struct ResumeConfirmation {
 pub struct TaskInventory {
     pub running: Vec<TaskSnapshot>,
     pub idle: Vec<TaskSnapshot>,
+    #[serde(default)]
+    pub quota_failed: Vec<TaskSnapshot>,
     pub blocked: Vec<TaskSnapshot>,
     pub unloaded_thread_ids: Vec<String>,
     pub unresolved_thread_ids: Vec<String>,
@@ -174,6 +235,10 @@ impl TaskInventory {
         self.candidate_coverage_complete
             && self.blocked.is_empty()
             && self.unresolved_thread_ids.is_empty()
+            && self
+                .quota_failed
+                .iter()
+                .all(TaskSnapshot::safely_quota_failed)
     }
 }
 
@@ -322,6 +387,7 @@ impl DesktopSession {
         for id in unique {
             match self.current_snapshot(&id) {
                 Some(task) if task.safely_running() => inventory.running.push(task),
+                Some(task) if task.safely_quota_failed() => inventory.quota_failed.push(task),
                 Some(task) if task.safely_idle() => inventory.idle.push(task),
                 Some(task) => inventory.blocked.push(task),
                 None if unloaded.contains(&id) => inventory.unloaded_thread_ids.push(id),
@@ -333,6 +399,9 @@ impl DesktopSession {
             .running
             .sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
         inventory.idle.sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
+        inventory
+            .quota_failed
+            .sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
         inventory
             .blocked
             .sort_by(|a, b| a.thread_id.cmp(&b.thread_id));
@@ -365,6 +434,58 @@ impl DesktopSession {
             ));
         }
         self.saved_settings_for(&task.thread_id).map(|_| ())
+    }
+
+    pub fn can_preserve_quota_failed_task(&self, task: &TaskSnapshot) -> Result<(), SessionError> {
+        if !task.safely_quota_failed()
+            || self.current_snapshot(&task.thread_id).as_ref() != Some(task)
+        {
+            return Err(SessionError::new(
+                SessionErrorKind::StateChanged,
+                "保存额度耗尽任务前原轮次、错误或等待状态已改变；未发送恢复请求",
+            ));
+        }
+        self.saved_settings_for(&task.thread_id).map(|_| ())
+    }
+
+    /// Own a recovery ticket for this exact quota failure without pretending
+    /// to interrupt an already failed turn. Only subscriptions/owner discovery
+    /// are sent; the flow journals this ticket before closing the desktop.
+    pub async fn capture_quota_failed_task<F>(
+        &mut self,
+        expected: &TaskSnapshot,
+        operation_id: &str,
+        guard: F,
+    ) -> Result<PausedTask, SessionError>
+    where
+        F: Fn() -> bool,
+    {
+        validate_id(operation_id)?;
+        if !guard() {
+            return Err(cancelled());
+        }
+        let current = self.fresh_snapshot(&expected.thread_id).await?;
+        if current != *expected || !current.recent_quota_failure() {
+            return Err(SessionError::new(
+                SessionErrorKind::StateChanged,
+                "额度耗尽任务的原轮次、错误、模型、权限或等待状态已改变",
+            ));
+        }
+        let saved_settings = self.saved_settings_for(&current.thread_id)?;
+        self.confirm_owner(&current).await?;
+        if !guard() {
+            return Err(cancelled());
+        }
+        Ok(PausedTask {
+            thread_id: current.thread_id,
+            turn_id: current.turn_id.unwrap(),
+            context: current.context,
+            pause_operation_id: operation_id.into(),
+            confirmed_by_cc_switch: false,
+            origin: RecoveryOrigin::QuotaExhausted,
+            turn_ended_at_ms: current.turn_ended_at_ms,
+            saved_settings: Some(saved_settings),
+        })
     }
 
     fn saved_settings_for(&self, thread_id: &str) -> Result<SavedTaskSettings, SessionError> {
@@ -419,7 +540,7 @@ impl DesktopSession {
         if !guard() {
             return Err(cancelled());
         }
-        if !paused.confirmed_by_cc_switch {
+        if paused.origin == RecoveryOrigin::CcSwitchPause && !paused.confirmed_by_cc_switch {
             return Err(SessionError::new(
                 SessionErrorKind::StateChanged,
                 "无法确认原任务由本次换号暂停；未发送恢复请求",
@@ -534,6 +655,8 @@ impl DesktopSession {
             context: current.context.clone(),
             pause_operation_id: operation_id.into(),
             confirmed_by_cc_switch: true,
+            origin: RecoveryOrigin::CcSwitchPause,
+            turn_ended_at_ms: None,
             saved_settings: Some(saved_settings),
         };
         let reply = self.request("thread-follower-interrupt-turn", json!({"conversationId":current.thread_id,"mode":"user-stop","expectedTurnId":turn_id}), Some(&current.owner), true).await;
@@ -1199,7 +1322,11 @@ fn resume_params(paused: &PausedTask, operation_id: &str) -> Value {
     // The desktop resolver treats usePermissionSelection=true as a request to
     // delegate permissions to current app-server defaults. Explicit false on
     // both selectors instead inherits this original thread's permissions.
-    let mut result = json!({"conversationId":paused.thread_id,"turnStart":{"request":{"threadId":paused.thread_id,"input":[{"type":"text","text":RESUME_TEXT,"text_elements":[]}],"clientUserMessageId":operation_id},"context":{"inheritThreadSettings":true,"usePermissionSelection":false,"useAppServerPermissionDefault":false}}});
+    let text = match paused.origin {
+        RecoveryOrigin::CcSwitchPause => RESUME_TEXT,
+        RecoveryOrigin::QuotaExhausted => QUOTA_RESUME_TEXT,
+    };
+    let mut result = json!({"conversationId":paused.thread_id,"turnStart":{"request":{"threadId":paused.thread_id,"input":[{"type":"text","text":text,"text_elements":[]}],"clientUserMessageId":operation_id},"context":{"inheritThreadSettings":true,"usePermissionSelection":false,"useAppServerPermissionDefault":false}}});
     if let Some(saved) = &paused.saved_settings {
         for key in [
             "approvalPolicy",
@@ -1241,11 +1368,9 @@ fn matches_reopened_pause(current: &TaskSnapshot, paused: &PausedTask) -> bool {
     if paused.saved_settings.is_none() {
         return current.matches_paused(paused);
     }
-    paused.confirmed_by_cc_switch
-        && current.thread_id == paused.thread_id
+    current.thread_id == paused.thread_id
         && current.turn_id.as_deref() == Some(paused.turn_id.as_str())
-        && current.status.as_deref() == Some("interrupted")
-        && current.safely_idle()
+        && current.matches_recovery_origin(paused)
         && !current.is_child
         && !current.ephemeral
         && same_saved_project_and_model(current, paused)
@@ -1683,11 +1808,13 @@ fn project_turn_path(path: &[String], value: &Value, is_array: bool) -> Option<V
     }
     if path.is_empty() {
         return Some(
-            json!({"turnId":value["turnId"],"status":value["status"],"turnStartedAtMs":value["turnStartedAtMs"],"params":{"clientUserMessageId":value.pointer("/params/clientUserMessageId").unwrap_or(&Value::Null)}}),
+            json!({"turnId":value["turnId"],"status":value["status"],"turnStartedAtMs":project_time_ms(&value["turnStartedAtMs"]),"durationMs":project_time_ms(&value["durationMs"]),"error":project_turn_error(&[], &value["error"]),"params":{"clientUserMessageId":value.pointer("/params/clientUserMessageId").unwrap_or(&Value::Null)}}),
         );
     }
     match path[0].as_str() {
-        "turnId" | "status" | "turnStartedAtMs" => Some(value.clone()),
+        "turnId" | "status" => Some(value.clone()),
+        "turnStartedAtMs" | "durationMs" => Some(project_time_ms(value)),
+        "error" => project_turn_error(&path[1..], value),
         "params" if path.len() == 1 => {
             Some(json!({"clientUserMessageId":value["clientUserMessageId"]}))
         }
@@ -1696,6 +1823,27 @@ fn project_turn_path(path: &[String], value: &Value, is_array: bool) -> Option<V
         }
         _ => None,
     }
+}
+
+/// The single quota enum is enough to classify the failure. Error messages,
+/// additionalDetails, unknown strings and structured error objects are never
+/// retained, including when received through incremental patches.
+fn project_turn_error(path: &[String], value: &Value) -> Option<Value> {
+    let quota_code = |value: &Value| {
+        if value.as_str() == Some("usageLimitExceeded") {
+            json!("usageLimitExceeded")
+        } else {
+            Value::Null
+        }
+    };
+    if path.is_empty() {
+        return Some(if value.is_null() {
+            Value::Null
+        } else {
+            json!({"codexErrorInfo":quota_code(&value["codexErrorInfo"])})
+        });
+    }
+    (path.len() == 1 && path[0] == "codexErrorInfo").then(|| quota_code(value))
 }
 
 fn project_history_path(path: &[String], value: &Value) -> Option<Value> {
@@ -1847,6 +1995,35 @@ fn metadata_path_exists(root: &Value, path: &[String]) -> bool {
     true
 }
 
+fn project_time_ms(value: &Value) -> Value {
+    value
+        .as_i64()
+        .filter(|time| *time >= 0)
+        .map(|time| json!(time))
+        .unwrap_or(Value::Null)
+}
+
+fn wall_clock_ms() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_millis()).ok())
+}
+
+fn terminal_time_ms(turn: &Value) -> Option<i64> {
+    if !matches!(
+        turn["status"].as_str(),
+        Some("failed" | "completed" | "interrupted")
+    ) {
+        return None;
+    }
+    let start = turn["turnStartedAtMs"]
+        .as_i64()
+        .filter(|value| *value >= 0)?;
+    let duration = turn["durationMs"].as_i64().filter(|value| *value >= 0)?;
+    start.checked_add(duration)
+}
+
 fn summarize(state: &Value, owner: &str) -> Option<TaskSnapshot> {
     let last = if state.pointer("/turnHistory/kind").and_then(Value::as_str) == Some("canonical") {
         let history = &state["turnHistory"]["history"];
@@ -1886,6 +2063,12 @@ fn summarize(state: &Value, owner: &str) -> Option<TaskSnapshot> {
         owner: owner.into(),
         turn_id: last["turnId"].as_str().map(str::to_string),
         status: last["status"].as_str().map(str::to_string),
+        turn_error_code: last
+            .pointer("/error/codexErrorInfo")
+            .and_then(Value::as_str)
+            .filter(|code| *code == "usageLimitExceeded")
+            .map(str::to_string),
+        turn_ended_at_ms: terminal_time_ms(last),
         runtime_status: state
             .pointer("/threadRuntimeStatus/type")
             .and_then(Value::as_str)
@@ -1945,6 +2128,187 @@ mod tests {
     fn projected(status: &str) -> Value {
         project_at(&[], &state(status)).unwrap()
     }
+
+    fn quota_failed_state() -> Value {
+        static TEST_END: std::sync::LazyLock<i64> =
+            std::sync::LazyLock::new(|| wall_clock_ms().unwrap() - 60_000);
+        let mut value = state("failed");
+        value["turns"][0]["turnStartedAtMs"] = json!(*TEST_END - 10_000);
+        value["turns"][0]["durationMs"] = json!(10_000);
+        value["threadRuntimeStatus"]["type"] = json!("systemError");
+        value["turns"][0]["error"] = json!({"codexErrorInfo":"usageLimitExceeded",
+            "message":"private server error message", "additionalDetails":"private diagnostics"});
+        value
+    }
+
+    fn quota_ticket() -> PausedTask {
+        let original = quota_failed_state();
+        let task = summarize(&project_at(&[], &original).unwrap(), "owner").unwrap();
+        PausedTask {
+            thread_id: THREAD.into(),
+            turn_id: "original-turn".into(),
+            context: task.context,
+            pause_operation_id: OP.into(),
+            confirmed_by_cc_switch: false,
+            origin: RecoveryOrigin::QuotaExhausted,
+            turn_ended_at_ms: task.turn_ended_at_ms,
+            saved_settings: Some(capture_saved_settings(&original).unwrap()),
+        }
+    }
+
+    #[test]
+    fn quota_failure_projection_keeps_only_supported_error_enum_in_both_histories() {
+        let value = quota_failed_state();
+        let metadata = project_at(&[], &value).unwrap();
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("additionalDetails"));
+        assert!(!encoded.contains("\"message\""));
+        let task = summarize(&metadata, "owner").unwrap();
+        assert!(task.safely_quota_failed());
+        assert!(task.matches_paused(&quota_ticket()));
+        let mut canonical = value.clone();
+        canonical.as_object_mut().unwrap().remove("turns");
+        canonical["turnHistory"] = json!({"kind":"canonical", "history":{
+            "entitiesByKey":{"last":value["turns"][0]},
+            "islands":[{"entries":[{"value":"last"}]}]}});
+        let metadata = project_at(&[], &canonical).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+    }
+
+    #[test]
+    fn quota_error_patches_clear_recovery_when_error_changes_without_retaining_text() {
+        let mut metadata = project_at(&[], &quota_failed_state()).unwrap();
+        apply_metadata_patches(&mut metadata, &json!([
+            {"op":"replace","path":["turns",0,"error","message"],"value":"private changed text"},
+            {"op":"replace","path":["turns",0,"error","codexErrorInfo"],"value":"serverOverloaded"}
+        ])).unwrap();
+        assert!(!summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+        apply_metadata_patches(
+            &mut metadata,
+            &json!([
+                {"op":"replace","path":["turns",0,"error"],"value":{
+                    "codexErrorInfo":"usageLimitExceeded","message":"private"}}
+            ]),
+        )
+        .unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        apply_metadata_patches(
+            &mut metadata,
+            &json!([
+                {"op":"remove","path":["turns",0,"error","codexErrorInfo"]}
+            ]),
+        )
+        .unwrap();
+        assert!(!summarize(&metadata, "owner").unwrap().safely_quota_failed());
+    }
+
+    #[test]
+    fn quota_recovery_rejects_user_stop_completion_new_turn_approval_and_other_errors() {
+        let ticket = quota_ticket();
+        for changed in 0..12 {
+            let mut value = quota_failed_state();
+            match changed {
+                0 => value["turns"][0]["status"] = json!("interrupted"),
+                1 => value["turns"][0]["status"] = json!("completed"),
+                2 => value["turns"][0]["turnId"] = json!("user-new-turn"),
+                3 => value["turns"][0]["error"]["codexErrorInfo"] = json!("other"),
+                4 => value["requests"] = json!([{"message":"private approval"}]),
+                5 => value["unconfirmedTurnSubmissions"] = json!([{}]),
+                6 => value["threadRuntimeStatus"]["activeFlags"] = json!(["waitingOnApproval"]),
+                7 => value["threadRuntimeStatus"]["activeFlags"] = json!(["waitingOnUserInput"]),
+                8 => value["threadRuntimeStatus"]["type"] = json!("active"),
+                9 => value["agentNickname"] = json!("child"),
+                10 => value["ephemeral"] = json!(true),
+                _ => value["latestModel"] = json!("user-changed-model"),
+            }
+            let task = summarize(&project_at(&[], &value).unwrap(), "owner").unwrap();
+            assert!(!task.matches_paused(&ticket), "case {changed}");
+            assert!(
+                !matches_reopened_pause(&task, &ticket),
+                "reopened case {changed}"
+            );
+        }
+        let mut forged = ticket.clone();
+        forged.confirmed_by_cc_switch = true;
+        assert!(
+            !summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner")
+                .unwrap()
+                .matches_paused(&forged)
+        );
+        assert_eq!(
+            resume_params(&ticket, OP)["turnStart"]["request"]["input"][0]["text"],
+            QUOTA_RESUME_TEXT
+        );
+    }
+
+    #[test]
+    fn legacy_pause_ticket_defaults_to_original_pause_origin() {
+        let mut encoded = serde_json::to_value(paused()).unwrap();
+        encoded.as_object_mut().unwrap().remove("origin");
+        let legacy: PausedTask = serde_json::from_value(encoded).unwrap();
+        assert_eq!(legacy.origin, RecoveryOrigin::CcSwitchPause);
+        assert!(summarize(&projected("interrupted"), "owner")
+            .unwrap()
+            .matches_paused(&legacy));
+        assert!(
+            !summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner")
+                .unwrap()
+                .matches_paused(&legacy)
+        );
+    }
+
+    #[test]
+    fn quota_recovery_uses_recent_terminal_time_and_never_running_start_time() {
+        let now = wall_clock_ms().unwrap();
+        let snapshot = |start: Value, duration: Value| {
+            let mut value = quota_failed_state();
+            value["turns"][0]["turnStartedAtMs"] = start;
+            value["turns"][0]["durationMs"] = duration;
+            summarize(&project_at(&[], &value).unwrap(), "owner").unwrap()
+        };
+        // A long-running task can have failed just now; its starting time is
+        // irrelevant to whether this failure belongs to the current incident.
+        let just_failed = snapshot(json!(now - 3_600_000), json!(3_599_000));
+        assert_eq!(just_failed.turn_ended_at_ms, Some(now - 1_000));
+        assert!(just_failed.recent_quota_failure_at(now));
+        for (start, duration) in [
+            (json!(now - 16 * 60_000), json!(0)),
+            (json!(now + 5_001), json!(0)),
+            (json!(now), Value::Null),
+            (Value::Null, json!(1)),
+            (json!(-1), json!(1)),
+            (json!(now), json!(-1)),
+            (json!(i64::MAX), json!(1)),
+            (json!(now), json!("private invalid time")),
+        ] {
+            let task = snapshot(start, duration);
+            assert!(task.safely_quota_failed());
+            assert!(!task.recent_quota_failure_at(now));
+            let inventory = TaskInventory {
+                quota_failed: vec![task],
+                candidate_coverage_complete: true,
+                ..TaskInventory::default()
+            };
+            assert!(
+                inventory.safe_to_restart(),
+                "Old failure must not block switching"
+            );
+        }
+        assert!(snapshot(json!(now - 15 * 60_000), json!(0)).recent_quota_failure_at(now));
+        assert!(snapshot(json!(now + 5_000), json!(0)).recent_quota_failure_at(now));
+        let mut ticket = quota_ticket();
+        let task = summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner").unwrap();
+        ticket.turn_ended_at_ms = ticket.turn_ended_at_ms.map(|ended| ended + 1);
+        assert!(!task.matches_paused(&ticket));
+        assert!(!matches_reopened_pause(&task, &ticket));
+    }
     fn paused() -> PausedTask {
         let task = summarize(&projected("interrupted"), "owner").unwrap();
         PausedTask {
@@ -1953,6 +2317,8 @@ mod tests {
             context: task.context,
             pause_operation_id: OP.into(),
             confirmed_by_cc_switch: true,
+            origin: RecoveryOrigin::CcSwitchPause,
+            turn_ended_at_ms: None,
             saved_settings: None,
         }
     }
@@ -2336,6 +2702,8 @@ mod tests {
             pause_operation_id: OP.into(),
             confirmed_by_cc_switch: true,
             saved_settings: Some(capture_saved_settings(&original).unwrap()),
+            origin: RecoveryOrigin::CcSwitchPause,
+            turn_ended_at_ms: None,
         }
     }
 
@@ -2660,7 +3028,12 @@ mod tests {
             compatible: true,
             broken: false,
         };
-        let mut current = state(initial_status);
+        let quota_failed = initial_status == "quotaFailed";
+        let mut current = if quota_failed {
+            quota_failed_state()
+        } else {
+            state(initial_status)
+        };
         let handle = tokio::spawn(async move {
             let mut start_count = 0;
             let mut revision = 0;
@@ -2674,6 +3047,10 @@ mod tests {
                 } else if method == "thread-owner-discovery" {
                     write_frame(&mut server,json!({"type":"response","requestId":request["requestId"],"resultType":"success","handledByClientId":"owner","result":{}})).await;
                 } else if method == "thread-follower-interrupt-turn" {
+                    assert!(
+                        !quota_failed,
+                        "Already quota-failed turns must never receive an interrupt"
+                    );
                     assert_eq!(request["version"], 4);
                     assert_eq!(request["targetClientId"], "owner");
                     assert_eq!(request["params"]["expectedTurnId"], "original-turn");
@@ -2704,6 +3081,9 @@ mod tests {
                         false
                     );
                     let turn_request = &request["params"]["turnStart"]["request"];
+                    if quota_failed {
+                        assert_eq!(turn_request["input"][0]["text"], QUOTA_RESUME_TEXT);
+                    }
                     current["latestCollaborationMode"] = turn_request["collaborationMode"].clone();
                     current["latestReasoningEffort"] =
                         if turn_request["collaborationMode"].is_object() {
@@ -2712,6 +3092,7 @@ mod tests {
                             turn_request["effort"].clone()
                         };
                     current["turns"][0]["status"] = json!("inProgress");
+                    current["turns"][0]["error"] = Value::Null;
                     current["turns"][0]["turnId"] = json!("restored-turn");
                     current["turns"][0]["params"]["clientUserMessageId"] =
                         request["params"]["turnStart"]["request"]["clientUserMessageId"].clone();
@@ -2724,6 +3105,73 @@ mod tests {
             start_count
         });
         (session, handle)
+    }
+
+    #[tokio::test]
+    async fn quota_failed_ticket_is_captured_without_interrupt_and_resumed_once() {
+        let (mut session, owner) = mock_owner("quotaFailed", true);
+        let expected =
+            summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner").unwrap();
+        let inventory = session
+            .snapshot_safe_running_tasks(&[THREAD.into()])
+            .await
+            .unwrap();
+        assert!(inventory.running.is_empty());
+        assert!(inventory.blocked.is_empty());
+        assert_eq!(inventory.quota_failed.len(), 1);
+        session.can_preserve_quota_failed_task(&expected).unwrap();
+        let ticket = session
+            .capture_quota_failed_task(&expected, OP, || true)
+            .await
+            .unwrap();
+        assert_eq!(ticket.origin, RecoveryOrigin::QuotaExhausted);
+        assert!(!ticket.confirmed_by_cc_switch);
+        session
+            .wait_for_reopened_paused_chat(&ticket, || true)
+            .await
+            .unwrap();
+        let resumed = session
+            .resume_and_confirm(&ticket, OP, || true)
+            .await
+            .unwrap();
+        assert_eq!(resumed.turn_id, "restored-turn");
+        assert!(
+            session
+                .resume_and_confirm(&ticket, OP, || true)
+                .await
+                .unwrap()
+                .already_observed
+        );
+        drop(session);
+        assert_eq!(owner.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn quota_ticket_capture_rechecks_turn_and_cancel_before_any_mutation() {
+        let expected =
+            summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner").unwrap();
+        let (mut session, owner) = mock_owner("interrupted", true);
+        assert_eq!(
+            session
+                .capture_quota_failed_task(&expected, OP, || true)
+                .await
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::StateChanged
+        );
+        drop(session);
+        assert_eq!(owner.await.unwrap(), 0);
+        let (mut session, owner) = mock_owner("quotaFailed", true);
+        assert_eq!(
+            session
+                .capture_quota_failed_task(&expected, OP, || false)
+                .await
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Cancelled
+        );
+        drop(session);
+        assert_eq!(owner.await.unwrap(), 0);
     }
 
     #[tokio::test]
