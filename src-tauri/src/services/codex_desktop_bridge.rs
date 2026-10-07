@@ -10,14 +10,15 @@ use crate::services::codex_desktop_session::{
 use crate::services::ProviderService;
 use crate::services::{codex_auto_switch as monitor, codex_desktop_restart as restart};
 use crate::store::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use tauri::{Emitter, Manager};
 
 static FLOW_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+static RECORD_LOCK: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecoveryRecord {
     operation_id: String,
@@ -29,6 +30,18 @@ struct RecoveryRecord {
     runtime_identity_confirmed: bool,
     reopened_pid: Option<u32>,
     reopened_birth: Option<u64>,
+    #[serde(default)]
+    reopened_port: Option<u16>,
+    #[serde(default)]
+    wait_until: Option<i64>,
+    #[serde(default)]
+    waiting_account_id: Option<String>,
+    #[serde(default)]
+    wait_baselines: Vec<TaskSnapshot>,
+    #[serde(default)]
+    abandoned_tasks: Vec<String>,
+    #[serde(skip, default = "loaded_record")]
+    loaded: bool,
     planned_tasks: Vec<TaskSnapshot>,
     paused_tasks: Vec<PausedTask>,
     resume_intents: Vec<String>,
@@ -40,7 +53,12 @@ struct RecoveryRecord {
 
 impl Drop for RecoveryRecord {
     fn drop(&mut self) {
-        if self.phase == "completed" || self.phase == "checking" {
+        if self.loaded
+            || matches!(
+                self.phase.as_str(),
+                "completed" | "checking" | "waiting-for-reset" | "cancelled" | "superseded"
+            )
+        {
             return;
         }
         self.phase = if monitor::operation_generation() != self.generation {
@@ -53,6 +71,180 @@ impl Drop for RecoveryRecord {
             log::warn!("Codex recovery journal final state failed: {error}");
         }
     }
+}
+
+fn loaded_record() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotaResetWait {
+    pub operation_id: String,
+    pub provider_id: String,
+    pub account_id: String,
+    pub reset_at: i64,
+}
+
+fn read_record(path: &std::path::Path) -> Result<RecoveryRecord, String> {
+    let value = read_recovery_value(path)?;
+    let record: RecoveryRecord =
+        serde_json::from_value(value).map_err(|_| "额度等待记录损坏；未重放操作")?;
+    let id = uuid::Uuid::parse_str(&record.operation_id).map_err(|_| "额度等待操作标识无效")?;
+    if path.file_stem().and_then(|name| name.to_str()) != Some(id.to_string().as_str()) {
+        return Err("额度等待文件与操作标识不一致".into());
+    }
+    Ok(record)
+}
+
+fn read_recovery_value(path: &std::path::Path) -> Result<serde_json::Value, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|_| "额度等待记录无法读取；未重放操作")?;
+    let mut bytes = Vec::new();
+    file.take(1_048_577)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "额度等待记录读取失败")?;
+    if bytes.len() > 1_048_576 {
+        return Err("额度等待记录大小异常；未重放操作".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "额度等待记录损坏；未重放操作".into())
+}
+
+pub fn quota_reset_wait() -> Result<Option<QuotaResetWait>, String> {
+    quota_reset_wait_in(&crate::config::get_app_config_dir().join("codex-desktop-recovery"))
+}
+
+fn quota_reset_wait_in(directory: &std::path::Path) -> Result<Option<QuotaResetWait>, String> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("无法检查额度等待记录".into()),
+    };
+    let mut waiting = None;
+    for entry in entries {
+        let path = entry.map_err(|_| "无法枚举额度等待记录")?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        // Older completed recovery journals need not have the new wait fields.
+        // Parse the wait schema only for a live wait, not for old task history.
+        let value = read_recovery_value(&path)?;
+        if value["phase"] != "waiting-for-reset" {
+            continue;
+        }
+        let record = read_record(&path)?;
+        if waiting.is_some() {
+            return Err("发现多个未结束的额度等待计划；需核对，不自动继续".into());
+        }
+        if !record.resume_intents.is_empty()
+            || !record.resumed_tasks.is_empty()
+            || record.wait_baselines.len() != record.paused_tasks.len()
+        {
+            return Err("额度等待记录已有继续意图；需核对，不重复继续".into());
+        }
+        let mut task_ids = std::collections::HashSet::new();
+        for saved in &record.paused_tasks {
+            let baseline = record
+                .wait_baselines
+                .iter()
+                .find(|task| task.thread_id == saved.thread_id);
+            if !task_ids.insert(&saved.thread_id)
+                || !baseline.is_some_and(|task| matches_wait_baseline(task, task, saved))
+            {
+                return Err("额度等待记录的原聊天或轮次不一致；未自动继续".into());
+            }
+        }
+        waiting = Some(QuotaResetWait {
+            operation_id: record.operation_id.clone(),
+            provider_id: record.target_provider_id.clone(),
+            account_id: record
+                .waiting_account_id
+                .clone()
+                .ok_or("额度等待记录缺少账号绑定")?,
+            reset_at: record.wait_until.ok_or("额度等待记录缺少重置时间")?,
+        });
+    }
+    Ok(waiting)
+}
+
+fn wait_record_path(operation_id: &str) -> Result<std::path::PathBuf, String> {
+    let id = uuid::Uuid::parse_str(operation_id).map_err(|_| "额度等待操作标识无效")?;
+    Ok(crate::config::get_app_config_dir()
+        .join("codex-desktop-recovery")
+        .join(format!("{id}.json")))
+}
+
+fn cancelled_quota_wait_tickets() -> Result<Vec<PausedTask>, String> {
+    let directory = crate::config::get_app_config_dir().join("codex-desktop-recovery");
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err("无法核对已取消的额度等待任务".into()),
+    };
+    let mut cancelled = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(|_| "无法枚举已取消的额度等待任务")?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let value = read_recovery_value(&path)?;
+        if value["phase"] == "cancelled" && !value["waitUntil"].is_null() {
+            let tickets: Vec<PausedTask> = serde_json::from_value(value["pausedTasks"].clone())
+                .map_err(|_| "已取消的等待任务记录无法核对")?;
+            cancelled.extend(tickets);
+        }
+    }
+    Ok(cancelled)
+}
+
+fn inventory_block_reason(inventory: &TaskInventory) -> String {
+    let details = inventory
+        .blocked
+        .iter()
+        .take(8)
+        .map(|task| {
+            format!(
+                "{}:{} (runtime={}, turn={})",
+                task.thread_id,
+                task.waiting_reason
+                    .map(|reason| reason.as_str())
+                    .unwrap_or("unknownTaskState"),
+                task.runtime_status,
+                task.status.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    format!(
+        "需处理 {}，未确认 {}；{}",
+        inventory.blocked.len(),
+        inventory.unresolved_thread_ids.len(),
+        details
+    )
+}
+
+fn ensure_desktop_task_coverage(root_count: usize) -> Result<(), String> {
+    if root_count > 1 {
+        return Err(format!("检测到 {root_count} 个独立 Codex 桌面实例，协调接口无法核实每个实例的聊天覆盖范围；未暂停或关闭桌面。请保留一个独立实例后重试（同一实例的多个窗口可用）"));
+    }
+    Ok(())
+}
+
+pub fn invalidate_quota_waits() -> Result<(), String> {
+    if let Some(wait) = quota_reset_wait()? {
+        let mut record = read_record(&wait_record_path(&wait.operation_id)?)?;
+        record.phase = "cancelled".into();
+        record.persist()?;
+    }
+    Ok(())
+}
+
+pub fn update_quota_wait_time(operation_id: &str, reset_at: i64) -> Result<(), String> {
+    let mut record = read_record(&wait_record_path(operation_id)?)?;
+    if record.phase != "waiting-for-reset" {
+        return Err("额度等待计划已失效".into());
+    }
+    record.wait_until = Some(reset_at);
+    record.persist()
 }
 
 /// Uncertain mutations survive CC Switch restart as a visible reason to wait,
@@ -79,7 +271,7 @@ pub fn pending_recovery_reason() -> Option<String> {
         }
         if !matches!(
             record["phase"].as_str(),
-            Some("completed" | "cancelled" | "superseded")
+            Some("completed" | "cancelled" | "superseded" | "waiting-for-reset")
         ) {
             return Some(
                 "上次桌面流程被中断，结果需要核对；未重放关闭、换号或继续，可手动启用账号重新开始"
@@ -116,6 +308,9 @@ pub fn recovery_records_for_cancellation() -> Result<Vec<std::path::PathBuf>, St
 
 pub fn cancel_captured_recovery_records(paths: &[std::path::PathBuf]) -> Result<(), String> {
     use std::io::Write;
+    let _record_lock = RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     for path in paths {
         let bytes = std::fs::read(path).map_err(|_| "旧恢复记录无法读取；未重放操作")?;
         if bytes.len() > 1_048_576 {
@@ -148,6 +343,9 @@ pub fn cancel_captured_recovery_records(paths: &[std::path::PathBuf]) -> Result<
 }
 
 fn supersede_old_recovery_records() -> Result<(), String> {
+    let _record_lock = RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let directory = crate::config::get_app_config_dir().join("codex-desktop-recovery");
     let Ok(entries) = std::fs::read_dir(&directory) else {
         return Ok(());
@@ -180,18 +378,45 @@ fn supersede_old_recovery_records() -> Result<(), String> {
 
 impl RecoveryRecord {
     fn persist(&self) -> Result<(), String> {
+        self.persist_in(&crate::config::get_app_config_dir().join("codex-desktop-recovery"))
+    }
+
+    fn persist_in(&self, directory: &std::path::Path) -> Result<(), String> {
         use std::io::Write;
-        let directory = crate::config::get_app_config_dir().join("codex-desktop-recovery");
-        std::fs::create_dir_all(&directory).map_err(|_| "无法创建本次聊天恢复记录目录")?;
+        let _record_lock = RECORD_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::fs::create_dir_all(directory).map_err(|_| "无法创建本次聊天恢复记录目录")?;
+        let path = directory.join(format!("{}.json", self.operation_id));
+        if path.exists() {
+            let existing = read_recovery_value(&path)?;
+            if matches!(
+                existing["phase"].as_str(),
+                Some("cancelled" | "superseded" | "completed")
+            ) && self.phase != existing["phase"].as_str().unwrap_or("")
+            {
+                return Err("旧恢复计划已经结束或取消；未覆盖记录或重复继续".into());
+            }
+            if self.loaded
+                && self.phase == "waiting-for-reset"
+                && existing["phase"] != "waiting-for-reset"
+            {
+                return Err("额度等待状态已改变；未覆盖正在恢复的任务".into());
+            }
+        }
+        let encoded = serde_json::to_vec(self).map_err(|_| "本次聊天恢复记录编码失败")?;
+        if encoded.len() > 1_048_576 {
+            return Err("本次聊天恢复记录超出安全读取上限；未继续操作".into());
+        }
         let mut file =
-            tempfile::NamedTempFile::new_in(&directory).map_err(|_| "无法保存本次聊天恢复记录")?;
-        serde_json::to_writer(&mut file, self).map_err(|_| "本次聊天恢复记录编码失败")?;
+            tempfile::NamedTempFile::new_in(directory).map_err(|_| "无法保存本次聊天恢复记录")?;
+        file.write_all(&encoded)
+            .map_err(|_| "本次聊天恢复记录写入失败")?;
         file.flush().map_err(|_| "无法刷新本次聊天恢复记录")?;
         file.as_file()
             .sync_all()
             .map_err(|_| "无法同步本次聊天恢复记录")?;
-        file.persist(directory.join(format!("{}.json", self.operation_id)))
-            .map_err(|_| "无法提交本次聊天恢复记录")?;
+        file.persist(path).map_err(|_| "无法提交本次聊天恢复记录")?;
         Ok(())
     }
 }
@@ -269,6 +494,14 @@ async fn confirm_reopened_identity(
 ) -> Result<(), String> {
     let receipt =
         restart::last_identity_receipt().ok_or("没有本次新桌面的账号核验记录；未恢复聊天")?;
+    confirm_identity_receipt(expected, &receipt, guard).await
+}
+
+async fn confirm_identity_receipt(
+    expected: &DesktopIdentity,
+    receipt: &restart::IdentityReceipt,
+    guard: &Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         guard()?;
@@ -307,6 +540,7 @@ pub async fn switch_desktop_account(
         target_provider,
         generation,
         true,
+        None,
     )
     .await
     .map(|result| result.1)
@@ -325,9 +559,187 @@ pub async fn restart_activated_account(
         target_provider,
         generation,
         false,
+        None,
     )
     .await
     .map(|result| result.0)
+}
+
+/// Switch once to the earliest reset account, verifying its desktop before
+/// parking owned tickets. There is no continuation while quota is exhausted.
+pub async fn switch_and_wait_for_reset(
+    app: tauri::AppHandle,
+    source: String,
+    target: String,
+    generation: u64,
+    reset_at: i64,
+) -> Result<String, String> {
+    monitor::plan_is_current(&app, generation, &source)?;
+    run_lifecycle(app, source, target, generation, true, Some(reset_at))
+        .await
+        .map(|result| result.1)
+}
+
+fn receipt_for_wait(record: &RecoveryRecord) -> Result<restart::IdentityReceipt, String> {
+    if !record.desktop_restarted || !record.runtime_identity_confirmed {
+        return Err("等待任务的桌面重开或账号身份未确认；未继续".into());
+    }
+    Ok(restart::IdentityReceipt {
+        pid: record.reopened_pid.ok_or("额度等待缺少桌面进程标识")?,
+        birth: record.reopened_birth.ok_or("额度等待缺少桌面启动时间")?,
+        port: record.reopened_port.ok_or("额度等待缺少本次账号核验连接")?,
+    })
+}
+
+fn matches_wait_baseline(
+    current: &TaskSnapshot,
+    baseline: &TaskSnapshot,
+    saved: &PausedTask,
+) -> bool {
+    current.thread_id == saved.thread_id
+        && current.turn_id.as_deref() == Some(saved.turn_id.as_str())
+        && current.context == baseline.context
+        && !current.waiting
+        && !current.is_child
+        && !current.ephemeral
+        && match saved.origin {
+            codex_desktop_session::RecoveryOrigin::QuotaExhausted => {
+                current.safely_quota_failed() && current.turn_ended_at_ms == saved.turn_ended_at_ms
+            }
+            codex_desktop_session::RecoveryOrigin::CcSwitchPause => {
+                current.safely_idle() && current.status.as_deref() == Some("interrupted")
+            }
+        }
+}
+
+/// A timer may enter here only after a fresh usable quota sample. Persisted
+/// tickets are reconciled against the exact desktop and original task; this
+/// never repeats closing, enabling or starting the desktop.
+pub async fn resume_quota_reset_wait(
+    app: tauri::AppHandle,
+    wait: QuotaResetWait,
+    generation: u64,
+) -> Result<String, String> {
+    let _flow = FLOW_LOCK.lock().await;
+    monitor::plan_is_current(&app, generation, &wait.provider_id)?;
+    let mut record = read_record(&wait_record_path(&wait.operation_id)?)?;
+    if record.phase != "waiting-for-reset"
+        || record.waiting_account_id.as_deref() != Some(&wait.account_id)
+    {
+        return Err("额度等待计划已由用户操作取代；未继续".into());
+    }
+    let provider = app
+        .state::<AppState>()
+        .db
+        .get_provider_by_id(&wait.provider_id, AppType::Codex.as_str())
+        .map_err(|e| e.to_string())?
+        .ok_or("等待账号已移除")?;
+    if provider
+        .meta
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .as_deref()
+        != Some(&wait.account_id)
+    {
+        record.phase = "cancelled".into();
+        record.persist()?;
+        return Err("等待账号绑定已改变；旧任务恢复计划已失效".into());
+    }
+    check_target_login(&app, &wait.provider_id)?;
+    let guard_app = app.clone();
+    let provider_id = wait.provider_id.clone();
+    let guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync> =
+        Arc::new(move || check_selection(&guard_app, generation, &provider_id));
+    // A desktop that was not running has no tasks to continue or process to
+    // launch. Finish the wait after quota is truly available.
+    if record.paused_tasks.is_empty() {
+        record.phase = "completed".into();
+        record.persist()?;
+        return Ok("等待账号额度已恢复；本次没有需恢复的原任务".into());
+    }
+    let receipt = receipt_for_wait(&record)?;
+    if let Err(error) = restart::ensure_identity_desktop(&receipt) {
+        record.phase = "cancelled".into();
+        record.persist()?;
+        return Err(format!(
+            "等待期间桌面已关闭或重开，旧恢复计划已失效：{error}"
+        ));
+    }
+    let expected = target_identity(&app, &wait.provider_id)
+        .await?
+        .ok_or("等待账号身份无法核对")?;
+    confirm_identity_receipt(&expected, &receipt, &guard).await?;
+    guard()?;
+    monitor::retain_owned_recovery(generation)?;
+    let mut eligible = Vec::new();
+    for saved in &record.paused_tasks {
+        guard()?;
+        let mut verifier = connect_reopened_desktop(&guard).await?;
+        verifier
+            .begin_follow(&saved.thread_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        codex_desktop_session::open_original_chat(&saved.thread_id)
+            .map_err(|error| error.to_string())?;
+        restart::wait_for_navigation(&receipt, guard.as_ref()).await?;
+        confirm_identity_receipt(&expected, &receipt, &guard).await?;
+        let current = match verifier
+            .wait_for_reopened_paused_chat(saved, || guard().is_ok())
+            .await
+        {
+            Ok(current) => current,
+            Err(error)
+                if error.kind == codex_desktop_session::SessionErrorKind::StateChanged
+                    && !error.mutation_may_have_been_sent =>
+            {
+                record.abandoned_tasks.push(saved.thread_id.clone());
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let baseline = record
+            .wait_baselines
+            .iter()
+            .find(|task| task.thread_id == saved.thread_id)
+            .ok_or("额度等待任务缺少保存的基线；未继续")?;
+        if matches_wait_baseline(&current, baseline, saved) {
+            eligible.push(saved.clone());
+        } else {
+            // Clear the exact old ticket without stopping or overwriting the
+            // user's changed/completed/approval task. Other eligible tickets
+            // may still resume; this is not an uncertain mutating request.
+            record.abandoned_tasks.push(saved.thread_id.clone());
+        }
+    }
+    record.paused_tasks = eligible;
+    // Refresh only the generation. Original operation UUID and task tickets
+    // remain unchanged across hours of waiting and CC Switch restarts.
+    record.generation = generation;
+    record.loaded = false;
+    record.phase = "quota-reset-confirmed".into();
+    record.persist()?;
+    if let Err(error) = resume_saved_tasks(
+        &app,
+        generation,
+        &mut record,
+        guard,
+        Some(&expected),
+        receipt,
+    )
+    .await
+    {
+        if record.resume_intents.is_empty() {
+            record.phase = "cancelled".into();
+            record.persist()?;
+        }
+        return Err(error);
+    }
+    record.phase = "completed".into();
+    record.persist()?;
+    Ok(format!(
+        "额度已恢复并核对实际桌面账号；继续 {} 个原任务，{} 个被用户改变的任务保持原状",
+        record.resumed_tasks.len(),
+        record.abandoned_tasks.len()
+    ))
 }
 
 async fn run_lifecycle(
@@ -336,6 +748,7 @@ async fn run_lifecycle(
     target: String,
     generation: u64,
     automatic: bool,
+    wait_until: Option<i64>,
 ) -> Result<(bool, String), String> {
     let _flow = FLOW_LOCK.lock().await;
     check_selection(&app, generation, &source)?;
@@ -358,6 +771,21 @@ async fn run_lifecycle(
         runtime_identity_confirmed: false,
         reopened_pid: None,
         reopened_birth: None,
+        reopened_port: None,
+        wait_until,
+        waiting_account_id: app
+            .state::<AppState>()
+            .db
+            .get_provider_by_id(&target, AppType::Codex.as_str())
+            .map_err(|e| e.to_string())?
+            .and_then(|provider| {
+                provider
+                    .meta
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+            }),
+        loaded: false,
+        wait_baselines: Vec::new(),
+        abandoned_tasks: Vec::new(),
         planned_tasks: Vec::new(),
         paused_tasks: Vec::new(),
         resume_intents: Vec::new(),
@@ -366,7 +794,18 @@ async fn run_lifecycle(
         resumed_tasks: Vec::new(),
         resume_confirmations: Vec::new(),
     };
+    monitor::lifecycle_status(
+        &app,
+        generation,
+        "preflight",
+        "正在核对目标账号、桌面进程和原任务",
+    );
     let desktop_receipt = restart::desktop_receipt()?;
+    ensure_desktop_task_coverage(
+        desktop_receipt
+            .as_ref()
+            .map_or(0, restart::DesktopReceipt::root_count),
+    )?;
     let desktop_running = desktop_receipt.is_some();
     let mut ignored_quota_failures = 0usize;
     // A new explicit Enable may reopen a desktop left closed by a cancelled
@@ -393,15 +832,25 @@ async fn run_lifecycle(
         restart::ensure_same_desktop(&desktop_receipt)?;
         if !inventory.safe_to_restart() {
             return Err(format!(
-                "桌面有等待审批或状态未确认的任务（需处理 {}，未确认 {}）；未关闭桌面",
-                inventory.blocked.len(),
-                inventory.unresolved_thread_ids.len()
+                "桌面有等待审批或状态未确认的任务（{}）；未关闭桌面",
+                inventory_block_reason(&inventory)
             ));
         }
+        let cancelled_tickets = if automatic {
+            cancelled_quota_wait_tickets()?
+        } else {
+            Vec::new()
+        };
         let recent_quota_failures: Vec<_> = inventory
             .quota_failed
             .iter()
             .filter(|task| task.recent_quota_failure())
+            .filter(|task| {
+                !cancelled_tickets.iter().any(|saved| {
+                    task.thread_id == saved.thread_id
+                        && task.turn_id.as_deref() == Some(saved.turn_id.as_str())
+                })
+            })
             .cloned()
             .collect();
         ignored_quota_failures = inventory.quota_failed.len() - recent_quota_failures.len();
@@ -497,6 +946,17 @@ async fn run_lifecycle(
         }
     }
     record.phase = "close-intent".into();
+    if wait_until.is_some() && source == target && record.paused_tasks.is_empty() {
+        // A cancelled wait with no owned work must not cause a fresh restart
+        // of the same exhausted account on every later monitoring tick.
+        record.phase = "waiting-for-reset".into();
+        record.persist()?;
+        check_selection(&app, generation, &source)?;
+        return Ok((
+            false,
+            "当前账号最早重置；没有本次需恢复的任务，等待额度恢复，未重启桌面".into(),
+        ));
+    }
     record.persist()?;
     monitor::lifecycle_status(&app, generation, "closing", "正在正常关闭 Codex 并确认退出");
     let activated = Arc::new(AtomicBool::new(!automatic));
@@ -591,6 +1051,7 @@ async fn run_lifecycle(
     if let Some(receipt) = restart::last_identity_receipt() {
         record.reopened_pid = Some(receipt.pid);
         record.reopened_birth = Some(receipt.birth);
+        record.reopened_port = Some(receipt.port);
     }
     if restarted {
         record.phase = "desktop-restarted".into();
@@ -617,95 +1078,56 @@ async fn run_lifecycle(
     }
     .into();
     record.persist()?;
+    if wait_until.is_some() {
+        guard()?;
+        if !record.paused_tasks.is_empty() {
+            let receipt = restart::last_identity_receipt().ok_or("额度等待缺少本次新桌面记录")?;
+            for saved in record.paused_tasks.clone() {
+                guard()?;
+                let mut session = connect_reopened_desktop(&guard).await?;
+                session
+                    .begin_follow(&saved.thread_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                codex_desktop_session::open_original_chat(&saved.thread_id)
+                    .map_err(|e| e.to_string())?;
+                restart::wait_for_navigation(&receipt, guard.as_ref()).await?;
+                if let Some(expected) = expected_identity.as_ref() {
+                    confirm_identity_receipt(expected, &receipt, &guard).await?;
+                }
+                let baseline = session
+                    .wait_for_reopened_paused_chat(&saved, || guard().is_ok())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                record.wait_baselines.push(baseline);
+            }
+        }
+        record.phase = "waiting-for-reset".into();
+        record.persist()?;
+        if let Err(error) = guard() {
+            record.phase = "cancelled".into();
+            record.persist()?;
+            return Err(error);
+        }
+        return Ok((
+            restarted,
+            format!(
+                "已选择最早 5 小时重置的账号并核对桌面；保存 {} 个原任务等待重置，期间不发送继续",
+                record.paused_tasks.len()
+            ),
+        ));
+    }
     if restarted && !record.paused_tasks.is_empty() {
         let receipt = restart::last_identity_receipt().ok_or("本次重开记录已失效；未恢复原聊天")?;
-        let navigation_receipt = receipt.clone();
-        let previous_guard = guard.clone();
-        let resume_guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
-            previous_guard()?;
-            restart::ensure_identity_desktop(&receipt)
-        });
-        monitor::lifecycle_status(
+        resume_saved_tasks(
             &app,
             generation,
-            "resuming",
-            "正在恢复本次记录的原聊天，沿用原模型和权限",
-        );
-        for paused in record.paused_tasks.clone() {
-            resume_guard()?;
-            if let Some(expected) = expected_identity.as_ref() {
-                confirm_reopened_identity(expected, &resume_guard).await?;
-            }
-            // Subscribe before navigation so the original owner registering
-            // during startup cannot be missed by a one-shot subscription.
-            let mut session = connect_reopened_desktop(&resume_guard).await?;
-            session
-                .begin_follow(&paused.thread_id)
-                .await
-                .map_err(|e| e.to_string())?;
-            codex_desktop_session::open_original_chat(&paused.thread_id)
-                .map_err(|e| e.to_string())?;
-            restart::wait_for_navigation(&navigation_receipt, guard.as_ref()).await?;
-            if let Some(expected) = expected_identity.as_ref() {
-                confirm_reopened_identity(expected, &resume_guard).await?;
-            }
-            monitor::lifecycle_status(
-                &app,
-                generation,
-                "waiting-for-chat",
-                "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
-            );
-            session
-                .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
-                .await
-                .map_err(|e| e.to_string())?;
-            monitor::lifecycle_status(
-                &app,
-                generation,
-                "resuming",
-                "正在用原聊天恢复请求继续任务，保留本次换号前的模型和权限",
-            );
-            if let Some(expected) = expected_identity.as_ref() {
-                confirm_reopened_identity(expected, &resume_guard).await?;
-            }
-            // Persist the unique intent before sending once. A crash/timeout
-            // leaves a needs-review record; startup never replays continuation.
-            record.phase = "resume-intent".into();
-            record.resume_intents.push(paused.thread_id.clone());
-            record.persist()?;
-            let resume = session
-                .resume_and_confirm(&paused, &record.operation_id, || resume_guard().is_ok())
-                .await;
-            let confirmation = match resume {
-                Ok(confirmation) => confirmation,
-                Err(error) => {
-                    // Reconciliation reads the new turn; it never repeats start.
-                    match session
-                        .reconcile_resume(&paused, &record.operation_id)
-                        .await
-                    {
-                        Ok(confirmation) => confirmation,
-                        Err(_) => {
-                            record.phase = "resume-outcome-needs-review".into();
-                            record.persist()?;
-                            return Err(format!(
-                                "账号已启用且桌面已重开，但原聊天恢复未确认：{error}；未重复继续"
-                            ));
-                        }
-                    }
-                }
-            };
-            record.resume_confirmations.push(confirmation);
-            // The single original resume request resolves these settings as
-            // part of starting its new turn. Record them only after the live
-            // new turn's model, project and permission semantics are confirmed.
-            record
-                .settings_restored_tasks
-                .push(paused.thread_id.clone());
-            record.resumed_tasks.push(paused.thread_id.clone());
-            record.phase = "resumed".into();
-            record.persist()?;
-        }
+            &mut record,
+            guard.clone(),
+            expected_identity.as_ref(),
+            receipt,
+        )
+        .await?;
     }
     record.phase = "completed".into();
     record.persist()?;
@@ -725,6 +1147,113 @@ async fn run_lifecycle(
     }
     monitor::lifecycle_status(&app, generation, "completed", &message);
     Ok((restarted, message))
+}
+
+async fn resume_saved_tasks(
+    app: &tauri::AppHandle,
+    generation: u64,
+    record: &mut RecoveryRecord,
+    guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    expected_identity: Option<&DesktopIdentity>,
+    receipt: restart::IdentityReceipt,
+) -> Result<(), String> {
+    let navigation_receipt = receipt.clone();
+    let previous_guard = guard.clone();
+    let resume_guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+        previous_guard()?;
+        restart::ensure_identity_desktop(&receipt)
+    });
+    monitor::lifecycle_status(
+        &app,
+        generation,
+        "resuming",
+        "正在恢复本次记录的原聊天，沿用原模型和权限",
+    );
+    for paused in record.paused_tasks.clone() {
+        resume_guard()?;
+        if let Some(expected) = expected_identity {
+            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+        }
+        // Subscribe before navigation so the original owner registering
+        // during startup cannot be missed by a one-shot subscription.
+        let mut session = connect_reopened_desktop(&resume_guard).await?;
+        session
+            .begin_follow(&paused.thread_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        codex_desktop_session::open_original_chat(&paused.thread_id).map_err(|e| e.to_string())?;
+        restart::wait_for_navigation(&navigation_receipt, guard.as_ref()).await?;
+        if let Some(expected) = expected_identity {
+            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+        }
+        monitor::lifecycle_status(
+            &app,
+            generation,
+            "waiting-for-chat",
+            "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
+        );
+        let actual = session
+            .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
+            .await
+            .map_err(|e| e.to_string())?;
+        if !record.wait_baselines.is_empty() {
+            let baseline = record
+                .wait_baselines
+                .iter()
+                .find(|task| task.thread_id == paused.thread_id)
+                .ok_or("额度等待任务缺少原设置基线；未继续")?;
+            if actual.context != baseline.context {
+                return Err("等待期间原任务的项目、模型或权限已被用户修改；未覆盖用户设置".into());
+            }
+        }
+        monitor::lifecycle_status(
+            &app,
+            generation,
+            "resuming",
+            "正在用原聊天恢复请求继续任务，保留本次换号前的模型和权限",
+        );
+        if let Some(expected) = expected_identity {
+            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+        }
+        // Persist the unique intent before sending once. A crash/timeout
+        // leaves a needs-review record; startup never replays continuation.
+        record.phase = "resume-intent".into();
+        record.resume_intents.push(paused.thread_id.clone());
+        record.persist()?;
+        let resume = session
+            .resume_and_confirm(&paused, &record.operation_id, || resume_guard().is_ok())
+            .await;
+        let confirmation = match resume {
+            Ok(confirmation) => confirmation,
+            Err(error) => {
+                // Reconciliation reads the new turn; it never repeats start.
+                match session
+                    .reconcile_resume(&paused, &record.operation_id)
+                    .await
+                {
+                    Ok(confirmation) => confirmation,
+                    Err(_) => {
+                        record.phase = "resume-outcome-needs-review".into();
+                        record.persist()?;
+                        return Err(format!(
+                            "账号已启用且桌面已重开，但原聊天恢复未确认：{error}；未重复继续"
+                        ));
+                    }
+                }
+            }
+        };
+        record.resume_confirmations.push(confirmation);
+        // The single original resume request resolves these settings as
+        // part of starting its new turn. Record them only after the live
+        // new turn's model, project and permission semantics are confirmed.
+        record
+            .settings_restored_tasks
+            .push(paused.thread_id.clone());
+        record.resumed_tasks.push(paused.thread_id.clone());
+        record.phase = "resumed".into();
+        record.persist()?;
+    }
+    Ok(())
 }
 
 async fn confirm_tasks_before_shutdown(paused: &[PausedTask]) -> Result<(), String> {
@@ -831,6 +1360,182 @@ mod tests {
         serde_json::from_value(json!({"threadId":task.thread_id,"turnId":task.turn_id,
             "context":task.context,"pauseOperationId":"operation-A","confirmedByCcSwitch":true}))
         .unwrap()
+    }
+
+    fn wait_record(id: &str) -> RecoveryRecord {
+        let task = original_task();
+        serde_json::from_value(json!({
+            "operationId":id,"generation":1,"sourceProviderId":"source",
+            "targetProviderId":"target","phase":"waiting-for-reset",
+            "desktopRestarted":true,"runtimeIdentityConfirmed":true,
+            "reopenedPid":123,"reopenedBirth":456,"reopenedPort":9222,
+            "waitUntil":1_800_000_000_000i64,"waitingAccountId":"account",
+            "waitBaselines":[task],"plannedTasks":[],"pausedTasks":[paused(&task)],
+            "resumeIntents":[],"settingsRestoreIntents":[],"settingsRestoredTasks":[],
+            "resumedTasks":[],"resumeConfirmations":[]
+        }))
+        .unwrap()
+    }
+
+    const WAIT_ID: &str = "44444444-4444-4444-8444-444444444444";
+
+    #[test]
+    fn ordinary_multi_window_instance_has_coverage_but_independent_instances_do_not() {
+        assert!(ensure_desktop_task_coverage(0).is_ok());
+        assert!(ensure_desktop_task_coverage(1).is_ok());
+        let error = ensure_desktop_task_coverage(2).unwrap_err();
+        assert!(error.contains("聊天覆盖范围"));
+        assert!(error.contains("未暂停或关闭"));
+    }
+
+    #[test]
+    fn waiting_journal_survives_reload_without_writing_or_replaying_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = wait_record(WAIT_ID);
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = std::fs::read(&path).unwrap();
+        let wait = quota_reset_wait_in(directory.path()).unwrap().unwrap();
+        assert_eq!(wait.operation_id, WAIT_ID);
+        assert_eq!(wait.provider_id, "target");
+        assert_eq!(wait.reset_at, 1_800_000_000_000i64);
+        let loaded = read_record(&path).unwrap();
+        assert!(loaded.loaded);
+        assert!(loaded.resume_intents.is_empty());
+        assert!(loaded.resumed_tasks.is_empty());
+        assert_eq!(receipt_for_wait(&loaded).unwrap().port, 9222);
+        drop(loaded);
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn terminal_cancellation_cannot_be_overwritten_by_a_delayed_wait_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = wait_record(WAIT_ID);
+        original.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let mut stale = read_record(&path).unwrap();
+        let mut cancelled = read_record(&path).unwrap();
+        cancelled.phase = "cancelled".into();
+        cancelled.persist_in(directory.path()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        stale.wait_until = Some(1_800_001_000_000i64);
+        assert!(stale.persist_in(directory.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(quota_reset_wait_in(directory.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn oversized_wait_write_preserves_the_last_readable_recovery_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut record = wait_record(WAIT_ID);
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = std::fs::read(&path).unwrap();
+        record.abandoned_tasks.push("x".repeat(1_048_577));
+        assert!(record
+            .persist_in(directory.path())
+            .unwrap_err()
+            .contains("上限"));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(quota_reset_wait_in(directory.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn loaded_wait_update_cannot_restore_waiting_over_a_resume_intent() {
+        let directory = tempfile::tempdir().unwrap();
+        wait_record(WAIT_ID).persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let stale = read_record(&path).unwrap();
+        let mut active = read_record(&path).unwrap();
+        active.phase = "resume-intent".into();
+        active.resume_intents.push("original".into());
+        active.persist_in(directory.path()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(stale.persist_in(directory.path()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn wait_reader_rejects_duplicate_plans_missing_baselines_and_existing_resume_intents() {
+        let directory = tempfile::tempdir().unwrap();
+        wait_record(WAIT_ID).persist_in(directory.path()).unwrap();
+        let other_id = "55555555-5555-4555-8555-555555555555";
+        wait_record(other_id).persist_in(directory.path()).unwrap();
+        assert!(quota_reset_wait_in(directory.path())
+            .unwrap_err()
+            .contains("多个"));
+        std::fs::remove_file(directory.path().join(format!("{other_id}.json"))).unwrap();
+        for changed in 0..5 {
+            let mut record = wait_record(WAIT_ID);
+            match changed {
+                0 => record.wait_baselines.clear(),
+                1 => record.resume_intents.push("original".into()),
+                2 => record.wait_baselines[0].turn_id = Some("another-turn".into()),
+                3 => record.wait_baselines[0].waiting = true,
+                _ => record.waiting_account_id = None,
+            }
+            record.persist_in(directory.path()).unwrap();
+            assert!(
+                quota_reset_wait_in(directory.path()).is_err(),
+                "case {changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn wait_reader_ignores_completed_legacy_schema_but_rejects_corruption_and_wrong_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("legacy.json");
+        std::fs::write(&legacy, r#"{"phase":"completed"}"#).unwrap();
+        assert!(quota_reset_wait_in(directory.path()).unwrap().is_none());
+        let record = wait_record(WAIT_ID);
+        let wrong_path = directory.path().join("wrong-id.json");
+        std::fs::write(&wrong_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(quota_reset_wait_in(directory.path()).is_err());
+        std::fs::remove_file(wrong_path).unwrap();
+        std::fs::write(&legacy, b"broken-json").unwrap();
+        assert!(quota_reset_wait_in(directory.path()).is_err());
+        std::fs::write(&legacy, vec![b' '; 1_048_577]).unwrap();
+        assert!(read_recovery_value(&legacy)
+            .unwrap_err()
+            .contains("大小异常"));
+    }
+
+    #[test]
+    fn owned_quota_failure_survives_hours_of_wait_but_never_resumes_changed_user_work() {
+        let mut original = original_task();
+        original.status = Some("failed".into());
+        original.runtime_status = "systemError".into();
+        original.turn_error_code = Some("usageLimitExceeded".into());
+        original.turn_ended_at_ms =
+            Some(chrono::Utc::now().timestamp_millis() - 4 * 60 * 60 * 1_000);
+        assert!(!original.recent_quota_failure());
+        let saved: PausedTask = serde_json::from_value(json!({
+            "threadId":original.thread_id,"turnId":original.turn_id,"context":original.context,
+            "pauseOperationId":WAIT_ID,"confirmedByCcSwitch":false,"origin":"quotaExhausted",
+            "turnEndedAtMs":original.turn_ended_at_ms
+        }))
+        .unwrap();
+        assert!(matches_wait_baseline(&original, &original, &saved));
+        for changed in 0..9 {
+            let mut current = original.clone();
+            match changed {
+                0 => current.status = Some("interrupted".into()),
+                1 => current.status = Some("completed".into()),
+                2 => current.turn_id = Some("user-new-turn".into()),
+                3 => current.waiting = true,
+                4 => current.runtime_status = "active".into(),
+                5 => current.context.model = Some("user-new-model".into()),
+                6 => current.context.current_permissions = json!("user-changed-permissions"),
+                7 => current.turn_error_code = Some("anotherError".into()),
+                _ => current.turn_ended_at_ms = original.turn_ended_at_ms.map(|time| time + 1),
+            }
+            assert!(
+                !matches_wait_baseline(&current, &original, &saved),
+                "case {changed}"
+            );
+        }
     }
 
     #[test]

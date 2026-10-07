@@ -2,6 +2,10 @@
 //! The ordinary provider switch is never blocked by this optional operation.
 //! Windows Restart Manager requests normal session cleanup (no force flag),
 //! and package activation preserves the desktop's original launch environment.
+//! Multiple windows/renderers below one packaged root are one desktop. The
+//! bridge rejects independent multi-root instances until their task-owner
+//! coverage is proven; the restart layer binds exact roots rather than picking
+//! one process or using an executable-name-wide termination.
 
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -23,23 +27,32 @@ pub fn last_identity_receipt() -> Option<IdentityReceipt> {
     IDENTITY_RECEIPT.lock().ok()?.clone()
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DesktopReceipt {
-    pid: u32,
-    birth: u64,
+    roots: Vec<Desktop>,
+}
+
+impl DesktopReceipt {
+    pub fn root_count(&self) -> usize {
+        self.roots.len()
+    }
+}
+
+fn receipt_for(roots: &[Desktop]) -> Option<DesktopReceipt> {
+    if roots.is_empty() {
+        return None;
+    }
+    let mut roots = roots.to_vec();
+    roots.sort_by_key(|root| (root.pid, root.birth));
+    Some(DesktopReceipt { roots })
 }
 
 pub fn desktop_receipt() -> Result<Option<DesktopReceipt>, String> {
     #[cfg(target_os = "windows")]
     {
-        let rows = native::desktops()?;
-        if rows.len() > 1 {
-            return Err("检测到多个独立 Codex 桌面；未选择关闭目标".into());
-        }
-        Ok(rows.first().map(|desktop| DesktopReceipt {
-            pid: desktop.pid,
-            birth: desktop.birth,
-        }))
+        let rows = native::settled_desktops()?;
+        validate_restart_roots(&rows)?;
+        Ok(receipt_for(&rows))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -58,14 +71,46 @@ fn validate_same_desktop(
 }
 
 pub fn ensure_same_desktop(expected: &Option<DesktopReceipt>) -> Result<(), String> {
-    validate_same_desktop(expected, &desktop_receipt()?)
+    #[cfg(target_os = "windows")]
+    {
+        let roots = native::desktops()?;
+        validate_restart_roots(&roots)?;
+        let actual = receipt_for(&roots);
+        if actual == *expected {
+            return Ok(());
+        }
+        // Only an added protocol/single-instance entry can settle back to
+        // the bound set. Missing/reborn roots cannot become the same process
+        // again. Normal guard checks therefore do not sleep for every task.
+        let may_be_handoff = expected
+            .as_ref()
+            .is_some_and(|expected| expected.roots.iter().all(|root| roots.contains(root)));
+        if may_be_handoff {
+            validate_same_desktop(expected, &desktop_receipt()?)
+        } else {
+            validate_same_desktop(expected, &actual)
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        validate_same_desktop(expected, &desktop_receipt()?)
+    }
 }
 
 pub fn ensure_identity_desktop(expected: &IdentityReceipt) -> Result<(), String> {
-    ensure_same_desktop(&Some(DesktopReceipt {
-        pid: expected.pid,
-        birth: expected.birth,
-    }))
+    #[cfg(target_os = "windows")]
+    let actual = receipt_for(&native::desktops()?);
+    #[cfg(not(target_os = "windows"))]
+    let actual = desktop_receipt()?;
+    if actual.as_ref().is_some_and(|receipt| {
+        receipt.roots.len() == 1
+            && receipt.roots[0].pid == expected.pid
+            && receipt.roots[0].birth == expected.birth
+    }) {
+        Ok(())
+    } else {
+        Err("本次新桌面已退出、被重开或出现其他实例；未恢复旧任务".into())
+    }
 }
 
 /// A protocol navigation can briefly launch a second single-instance entry
@@ -113,17 +158,16 @@ pub async fn wait_for_navigation(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let expected = DesktopReceipt {
-            pid: expected.pid,
-            birth: expected.birth,
-        };
+        let actual = native::desktops()?;
+        let root = actual
+            .iter()
+            .find(|desktop| desktop.pid == expected.pid && desktop.birth == expected.birth)
+            .ok_or_else(|| "本次新桌面已退出或被重开；未恢复旧任务".to_string())?;
+        let expected = receipt_for(std::slice::from_ref(root)).unwrap();
         wait_for_navigation_with(&expected, guard, || {
             Ok(native::desktops()?
                 .into_iter()
-                .map(|desktop| DesktopReceipt {
-                    pid: desktop.pid,
-                    birth: desktop.birth,
-                })
+                .map(|desktop| receipt_for(std::slice::from_ref(&desktop)).unwrap())
                 .collect())
         })
         .await?;
@@ -205,7 +249,7 @@ pub async fn restart_bound(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Desktop {
     pid: u32,
     birth: u64,
@@ -213,8 +257,132 @@ struct Desktop {
     application_id: String,
 }
 
+/// A process row captured from one ToolHelp snapshot.  The parent PID alone
+/// is not enough to identify an ancestor: Windows may reuse a PID while a
+/// stale row is still visible.  Every grouping decision therefore compares
+/// the parent's birth time with the child's birth time as well.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DesktopProcessRow {
+    desktop: Desktop,
+    parent_pid: u32,
+}
+
+fn same_package(a: &Desktop, b: &Desktop) -> bool {
+    a.family == b.family && a.application_id == b.application_id
+}
+
+/// Several windows may belong to one Electron root, or several independent
+/// roots of the same installed application. Bind the complete root set, never
+/// select an arbitrary process or close a different package/channel.
+fn validate_restart_roots(roots: &[Desktop]) -> Result<(), String> {
+    let Some(first) = roots.first() else {
+        return Ok(());
+    };
+    let mut ids = std::collections::HashSet::new();
+    if roots
+        .iter()
+        .any(|root| !same_package(root, first) || !ids.insert(root.pid))
+    {
+        return Err("Codex 桌面清单包含不同包身份或不明确的进程；未关闭任何桌面".into());
+    }
+    Ok(())
+}
+
+fn same_process_set(expected: &[(u32, u64)], actual: &[(u32, u64)]) -> bool {
+    let expected_set: std::collections::HashSet<_> = expected.iter().copied().collect();
+    let actual_set: std::collections::HashSet<_> = actual.iter().copied().collect();
+    expected.len() == expected_set.len()
+        && actual.len() == actual_set.len()
+        && expected
+            .iter()
+            .map(|(pid, _)| pid)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == expected.len()
+        && actual
+            .iter()
+            .map(|(pid, _)| pid)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            == actual.len()
+        && expected_set == actual_set
+}
+
+#[derive(Default)]
+struct DesktopSettleWatch {
+    previous: Option<Vec<Desktop>>,
+    stable_since: std::time::Duration,
+}
+
+impl DesktopSettleWatch {
+    fn observe(&mut self, roots: &[Desktop], elapsed: std::time::Duration) -> Result<bool, String> {
+        use std::time::Duration;
+        if self.previous.as_deref() != Some(roots) {
+            self.previous = Some(roots.to_vec());
+            self.stable_since = elapsed;
+        }
+        let stable = elapsed.saturating_sub(self.stable_since) >= Duration::from_millis(250);
+        // Allow a transient single-instance entry to exit before binding
+        // multiple roots. Persistent, stable roots are a legitimate group.
+        if stable && (roots.len() <= 1 || elapsed >= Duration::from_secs(2)) {
+            return Ok(true);
+        }
+        if elapsed >= Duration::from_secs(2) {
+            return Err("Codex 桌面进程清单仍在变化；未关闭桌面，请稍后重试".into());
+        }
+        Ok(false)
+    }
+}
+
+/// Return the top-level ChatGPT processes represented by one process
+/// snapshot.  ChatGPT can keep several renderer/main entries below one
+/// packaged root; those entries are one desktop.  Two roots with no valid
+/// birth-ordered ChatGPT ancestry remain separate and are intentionally
+/// reported to the caller instead of choosing one at random.
+fn root_desktops_from_rows(rows: &[DesktopProcessRow]) -> Vec<Desktop> {
+    let by_pid: std::collections::HashMap<u32, &DesktopProcessRow> =
+        rows.iter().map(|row| (row.desktop.pid, row)).collect();
+    let mut roots = rows
+        .iter()
+        .filter(|row| {
+            let mut current_pid = row.parent_pid;
+            let mut child_birth = row.desktop.birth;
+            let mut visited = std::collections::HashSet::new();
+            let mut found_chatgpt_parent = false;
+            let mut cycle = false;
+            while current_pid != 0 {
+                if !visited.insert(current_pid) {
+                    cycle = true;
+                    break;
+                }
+                let Some(parent) = by_pid.get(&current_pid) else {
+                    // The parent is another executable (or it disappeared
+                    // between snapshots), so no ChatGPT ancestor was proven.
+                    break;
+                };
+                // A parent born after its child is a reused PID, not an
+                // ancestor.  Treat the child as an independent root.
+                if !same_package(&parent.desktop, &row.desktop) {
+                    break;
+                }
+                if parent.desktop.birth >= child_birth {
+                    return true;
+                }
+                found_chatgpt_parent = true;
+                current_pid = parent.parent_pid;
+                child_birth = parent.desktop.birth;
+            }
+            cycle || !found_chatgpt_parent
+        })
+        .map(|row| row.desktop.clone())
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|desktop| (desktop.pid, desktop.birth));
+    roots.dedup_by_key(|desktop| (desktop.pid, desktop.birth));
+    roots
+}
+
 trait RestartRuntime {
-    fn running_desktop(&mut self) -> Result<Option<Desktop>, String>;
+    fn running_desktops(&mut self) -> Result<Vec<Desktop>, String>;
     fn pending_closed_desktop(&mut self) -> Option<Desktop> {
         None
     }
@@ -222,7 +390,7 @@ trait RestartRuntime {
     fn clear_pending_desktop(&mut self) {}
     fn close_and_confirm(
         &mut self,
-        desktop: &Desktop,
+        desktops: &[Desktop],
         guard: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String>;
     fn activate_and_confirm(
@@ -237,12 +405,10 @@ struct BoundRuntime<R> {
     expected: Option<DesktopReceipt>,
 }
 impl<R: RestartRuntime> RestartRuntime for BoundRuntime<R> {
-    fn running_desktop(&mut self) -> Result<Option<Desktop>, String> {
-        let current = self.inner.running_desktop()?;
-        let receipt = current.as_ref().map(|desktop| DesktopReceipt {
-            pid: desktop.pid,
-            birth: desktop.birth,
-        });
+    fn running_desktops(&mut self) -> Result<Vec<Desktop>, String> {
+        let current = self.inner.running_desktops()?;
+        validate_restart_roots(&current)?;
+        let receipt = receipt_for(&current);
         validate_same_desktop(&self.expected, &receipt)?;
         Ok(current)
     }
@@ -257,10 +423,10 @@ impl<R: RestartRuntime> RestartRuntime for BoundRuntime<R> {
     }
     fn close_and_confirm(
         &mut self,
-        desktop: &Desktop,
+        desktops: &[Desktop],
         guard: &dyn Fn() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.inner.close_and_confirm(desktop, guard)
+        self.inner.close_and_confirm(desktops, guard)
     }
     fn activate_and_confirm(
         &mut self,
@@ -295,7 +461,9 @@ fn restart_with_action_mode(
     recover_pending: bool,
 ) -> Result<bool, String> {
     check()?;
-    let Some(desktop) = runtime.running_desktop()? else {
+    let desktops = runtime.running_desktops()?;
+    validate_restart_roots(&desktops)?;
+    let Some(desktop) = desktops.first() else {
         let pending = recover_pending
             .then(|| runtime.pending_closed_desktop())
             .flatten();
@@ -313,21 +481,24 @@ fn restart_with_action_mode(
     // state takes precedence; an old activation receipt is never replayed.
     runtime.clear_pending_desktop();
     check()?;
-    runtime.close_and_confirm(&desktop, check)?;
-    runtime.remember_closed_desktop(&desktop);
+    runtime.close_and_confirm(&desktops, check)?;
+    runtime.remember_closed_desktop(desktop);
     // A separate post-exit guard records invalidation before launching. No
     // retry will replay the previous close when either guard fails.
     check()?;
     after_exit()?;
     check()?;
-    runtime.activate_and_confirm(&desktop, check)?;
+    runtime.activate_and_confirm(desktop, check)?;
     runtime.clear_pending_desktop();
     Ok(true)
 }
 
 #[cfg(target_os = "windows")]
 mod native {
-    use super::{Desktop, IdentityReceipt, RestartRuntime, IDENTITY_RECEIPT};
+    use super::{
+        root_desktops_from_rows, same_package, same_process_set, validate_restart_roots, Desktop,
+        DesktopProcessRow, DesktopSettleWatch, IdentityReceipt, RestartRuntime, IDENTITY_RECEIPT,
+    };
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
     use std::time::{Duration, Instant};
@@ -348,6 +519,7 @@ mod native {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::RestartManager::{
         RmEndSession, RmGetList, RmRegisterResources, RmShutdown, RmStartSession, RM_PROCESS_INFO,
         RM_UNIQUE_PROCESS,
@@ -356,7 +528,8 @@ mod native {
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
     };
     use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetCurrentProcessId, GetProcessTimes, OpenProcess, WaitForSingleObject,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::Shell::AO_NOERRORUI;
 
@@ -407,6 +580,22 @@ mod native {
 
     fn process(pid: u32) -> Result<Option<Desktop>, String> {
         unsafe {
+            let mut current_session = 0;
+            let mut process_session = 0;
+            if ProcessIdToSessionId(GetCurrentProcessId(), &mut current_session) == 0 {
+                return Err("无法核对 CC Switch 的 Windows 用户会话；未操作桌面".into());
+            }
+            if ProcessIdToSessionId(pid, &mut process_session) == 0 {
+                if GetLastError() == ERROR_INVALID_PARAMETER {
+                    return Ok(None);
+                }
+                return Err("无法核对 Codex 的 Windows 用户会话；未操作桌面".into());
+            }
+            // Never adopt an identically named package running in another
+            // logged-in user's/RDP session as this user's restart target.
+            if process_session != current_session {
+                return Ok(None);
+            }
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid);
             if handle.is_null() {
                 let error = GetLastError();
@@ -463,7 +652,7 @@ mod native {
         }
     }
 
-    fn desktop_process_rows() -> Result<Vec<(Desktop, u32)>, String> {
+    fn desktop_process_rows() -> Result<Vec<DesktopProcessRow>, String> {
         unsafe {
             let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if snapshot == INVALID_HANDLE_VALUE {
@@ -484,10 +673,16 @@ mod native {
                     .eq_ignore_ascii_case("ChatGPT.exe")
                 {
                     if let Some(desktop) = process(entry.th32ProcessID)? {
-                        rows.push((desktop, entry.th32ParentProcessID));
+                        rows.push(DesktopProcessRow {
+                            desktop,
+                            parent_pid: entry.th32ParentProcessID,
+                        });
                     }
                 }
                 available = Process32NextW(snapshot.0, &mut entry);
+            }
+            if GetLastError() != windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES {
+                return Err("Codex 桌面进程清单不完整；未关闭桌面".into());
             }
             Ok(rows)
         }
@@ -495,21 +690,36 @@ mod native {
 
     pub(super) fn desktops() -> Result<Vec<Desktop>, String> {
         let rows = desktop_process_rows()?;
-        let ids: std::collections::HashSet<_> = rows.iter().map(|r| r.0.pid).collect();
-        Ok(rows
-            .into_iter()
-            .filter(|(_, parent)| !ids.contains(parent))
-            .map(|(desktop, _)| desktop)
-            .collect())
+        Ok(root_desktops_from_rows(&rows))
+    }
+
+    /// Process creation and single-instance handoff are observable in several
+    /// snapshots. Brief secondary single-instance entries are allowed to
+    /// disappear; stable independent roots remain part of the bound group.
+    pub(super) fn settled_desktops() -> Result<Vec<Desktop>, String> {
+        let started = Instant::now();
+        let mut watch = DesktopSettleWatch::default();
+        loop {
+            let current = desktops()?;
+            if watch.observe(&current, started.elapsed())? {
+                return Ok(current);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     fn process_tree(desktop: &Desktop) -> Result<std::collections::HashSet<(u32, u64)>, String> {
         let rows = desktop_process_rows()?;
-        let mut ids = std::collections::HashSet::from([desktop.pid]);
+        let mut ids = std::collections::HashSet::from([(desktop.pid, desktop.birth)]);
         loop {
             let mut changed = false;
-            for (row, parent) in &rows {
-                if ids.contains(parent) && ids.insert(row.pid) {
+            for row in &rows {
+                if ids
+                    .iter()
+                    .any(|(pid, birth)| *pid == row.parent_pid && *birth < row.desktop.birth)
+                    && same_package(desktop, &row.desktop)
+                    && ids.insert((row.desktop.pid, row.desktop.birth))
+                {
                     changed = true;
                 }
             }
@@ -519,8 +729,8 @@ mod native {
         }
         Ok(rows
             .into_iter()
-            .filter(|(row, _)| ids.contains(&row.pid))
-            .map(|(row, _)| (row.pid, row.birth))
+            .filter(|row| ids.contains(&(row.desktop.pid, row.desktop.birth)))
+            .map(|row| (row.desktop.pid, row.desktop.birth))
             .collect())
     }
 
@@ -552,6 +762,17 @@ mod native {
                     && String::from_utf16_lossy(&entry.szExeFile[..end])
                         .eq_ignore_ascii_case("codex.exe")
                 {
+                    // An old renderer PID can be reused between snapshots.
+                    // Validate the current parent's complete birth identity
+                    // before adopting a backend into the exit wait set.
+                    if process(entry.th32ParentProcessID)?
+                        .as_ref()
+                        .is_none_or(|parent| parent.birth != *belongs_to_desktop.unwrap())
+                    {
+                        return Err(
+                            "原 Codex 后台的父进程身份已变化；未关闭桌面、未修改登录".into()
+                        );
+                    }
                     let raw = OpenProcess(
                         PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
                         0,
@@ -656,25 +877,30 @@ mod native {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = None;
         }
-        fn running_desktop(&mut self) -> Result<Option<Desktop>, String> {
-            let mut rows = desktops()?;
-            match rows.len() {
-                0 => Ok(None),
-                1 => Ok(rows.pop()),
-                _ => Err("检测到多个独立 Codex 桌面；请自行选择需要重开的桌面".into()),
-            }
+        fn running_desktops(&mut self) -> Result<Vec<Desktop>, String> {
+            let rows = desktops()?;
+            validate_restart_roots(&rows)?;
+            Ok(rows)
         }
 
         fn close_and_confirm(
             &mut self,
-            desktop: &Desktop,
+            desktops: &[Desktop],
             guard: &dyn Fn() -> Result<(), String>,
         ) -> Result<(), String> {
-            if process(desktop.pid)?.as_ref() != Some(desktop) {
-                return Err("原 Codex 桌面进程已变化；本次不会关闭其他进程".into());
+            validate_restart_roots(desktops)?;
+            if desktops.is_empty() || self::desktops()? != desktops {
+                return Err("原 Codex 桌面进程清单已变化；本次不会关闭其他进程".into());
             }
-            let handle = exact_process_handle(desktop)?;
-            let tree = process_tree(desktop)?;
+            let mut handles = Vec::new();
+            let mut tree = std::collections::HashSet::new();
+            for desktop in desktops {
+                if process(desktop.pid)?.as_ref() != Some(desktop) {
+                    return Err("原 Codex 桌面身份已变化；本次不会关闭其他进程".into());
+                }
+                handles.push(exact_process_handle(desktop)?);
+                tree.extend(process_tree(desktop)?);
+            }
             unsafe {
                 let mut session = 0;
                 let mut key = [0u16; 33];
@@ -683,28 +909,52 @@ mod native {
                     return Err(format!("无法发起 Codex 正常退出（Windows {result}）"));
                 }
                 let session = RestartSession(session);
-                let registered = RM_UNIQUE_PROCESS {
-                    dwProcessId: desktop.pid,
-                    ProcessStartTime: FILETIME {
-                        dwLowDateTime: desktop.birth as u32,
-                        dwHighDateTime: (desktop.birth >> 32) as u32,
-                    },
-                };
-                let result = RmRegisterResources(session.0, 0, null(), 1, &registered, 0, null());
+                let registered: Vec<_> = desktops
+                    .iter()
+                    .map(|desktop| RM_UNIQUE_PROCESS {
+                        dwProcessId: desktop.pid,
+                        ProcessStartTime: FILETIME {
+                            dwLowDateTime: desktop.birth as u32,
+                            dwHighDateTime: (desktop.birth >> 32) as u32,
+                        },
+                    })
+                    .collect();
+                let result = RmRegisterResources(
+                    session.0,
+                    0,
+                    null(),
+                    registered.len() as u32,
+                    registered.as_ptr(),
+                    0,
+                    null(),
+                );
                 if result != 0 {
                     return Err(format!("正常退出登记失败（Windows {result}）"));
                 }
                 let mut needed = 0;
-                let mut count = 1;
-                let mut info = RM_PROCESS_INFO::default();
+                let mut count = registered.len() as u32;
+                let mut info = vec![RM_PROCESS_INFO::default(); registered.len()];
                 let mut reasons = 0;
-                let result = RmGetList(session.0, &mut needed, &mut count, &mut info, &mut reasons);
-                if result == ERROR_MORE_DATA || result != 0 || reasons != 0 || count != 1 {
+                let result = RmGetList(
+                    session.0,
+                    &mut needed,
+                    &mut count,
+                    info.as_mut_ptr(),
+                    &mut reasons,
+                );
+                if result == ERROR_MORE_DATA
+                    || result != 0
+                    || reasons != 0
+                    || count as usize != registered.len()
+                {
                     return Err(format!("正常退出目标未能精确核对（Windows {result}，原因 {reasons}）；本次不关闭桌面"));
                 }
-                if info.Process.dwProcessId != desktop.pid
-                    || filetime(&info.Process.ProcessStartTime) != desktop.birth
-                {
+                let expected: Vec<_> = desktops.iter().map(|d| (d.pid, d.birth)).collect();
+                let actual: Vec<_> = info
+                    .iter()
+                    .map(|i| (i.Process.dwProcessId, filetime(&i.Process.ProcessStartTime)))
+                    .collect();
+                if !same_process_set(&expected, &actual) {
                     return Err("正常退出清单出现了其他进程；本次不关闭桌面".into());
                 }
                 // Do not use RmForceShutdown or TerminateProcess. This asks
@@ -713,33 +963,47 @@ mod native {
                     check_tasks()?;
                 }
                 guard()?;
+                // The task check may take time. A new/closed root invalidates
+                // the whole operation before the sole normal shutdown call.
+                if self::desktops()? != desktops {
+                    return Err("关闭前 Codex 桌面清单已变化；未关闭其他桌面，未修改登录".into());
+                }
+                // Include renderer children created during task suspension.
+                // Old known identities remain in the union for cleanup waits.
+                for desktop in desktops {
+                    tree.extend(process_tree(desktop)?);
+                }
                 let app_servers = app_server_handles(&tree)?;
+                guard()?;
                 let result = RmShutdown(session.0, NORMAL_SHUTDOWN_FLAGS, None);
                 let deadline = Instant::now() + Duration::from_secs(15);
                 while Instant::now() < deadline {
-                    let waited = WaitForSingleObject(handle.0, 100);
-                    if waited == 0 {
-                        let remaining = desktop_process_rows()?;
+                    let mut roots_exited = true;
+                    for handle in &handles {
+                        match WaitForSingleObject(handle.0, 0) {
+                            0 => {}
+                            258 => roots_exited = false,
+                            _ => return Err("原 Codex 的退出状态无法确认；不会重复启动".into()),
+                        }
+                    }
+                    let remaining = desktop_process_rows()?;
+                    if remaining
+                        .iter()
+                        .any(|row| !tree.contains(&(row.desktop.pid, row.desktop.birth)))
+                    {
+                        return Err(
+                            "正常退出期间检测到其他桌面进程；不会覆盖用户启动或重复重开".into()
+                        );
+                    }
+                    if roots_exited {
                         if remaining.is_empty() && app_servers_exited(&app_servers)? {
                             return Ok(());
-                        }
-                        if remaining
-                            .iter()
-                            .any(|(row, _)| !tree.contains(&(row.pid, row.birth)))
-                        {
-                            return Err(
-                                "原 Codex 已退出，但检测到其他桌面进程；不会覆盖用户启动或重复重开"
-                                    .into(),
-                            );
                         }
                         // The old renderer/GPU children may finish cleanup
                         // slightly after their main process. Wait for those
                         // known identities, without touching any new launch.
-                        std::thread::sleep(Duration::from_millis(100));
                     }
-                    if waited == u32::MAX {
-                        return Err("原 Codex 的退出状态无法确认；不会重复启动".into());
-                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
                 Err(format!(
                     "Codex 桌面或原后台未正常退出（Windows {result}）；未强制结束，未修改登录，未重复启动"
@@ -752,7 +1016,7 @@ mod native {
             desktop: &Desktop,
             guard: &dyn Fn() -> Result<(), String>,
         ) -> Result<(), String> {
-            if !desktops()?.is_empty() {
+            if !settled_desktops()?.is_empty() {
                 return Err("Codex 桌面已由其他操作启动；本次不重复启动".into());
             }
             guard()?;
@@ -765,7 +1029,7 @@ mod native {
                         && (next.pid != desktop.pid || next.birth != desktop.birth)
                         && next.birth >= receipt.not_before
                     {
-                        let roots = desktops()?;
+                        let roots = settled_desktops()?;
                         if expected_activated_main(desktop, &next, &receipt, &roots) {
                             guard()?;
                             *IDENTITY_RECEIPT
@@ -892,7 +1156,7 @@ mod native {
             let mut pid = 0;
             // Recheck after COM setup: another user launch must not be adopted
             // as this operation's newly created desktop.
-            if !desktops()?.is_empty() {
+            if !settled_desktops()?.is_empty() {
                 return Err("Codex 已由其他操作启动；本次不重复激活桌面".into());
             }
             guard()?;
@@ -1028,8 +1292,8 @@ mod tests {
     #[test]
     fn navigation_waits_for_late_single_instance_handoff_without_ignoring_extra_desktops() {
         use std::time::Duration;
-        let expected = DesktopReceipt { pid: 10, birth: 20 };
-        let extra = DesktopReceipt { pid: 11, birth: 21 };
+        let expected = synthetic_receipt(10, 20);
+        let extra = synthetic_receipt(11, 21);
         let mut watch = NavigationWatch::default();
         for (millis, roots, ready) in [
             (0, vec![expected.clone()], false),
@@ -1050,8 +1314,8 @@ mod tests {
     #[test]
     fn navigation_rejects_persistent_extra_desktop_and_changed_main() {
         use std::time::Duration;
-        let expected = DesktopReceipt { pid: 10, birth: 20 };
-        let extra = DesktopReceipt { pid: 11, birth: 21 };
+        let expected = synthetic_receipt(10, 20);
+        let extra = synthetic_receipt(11, 21);
         assert!(NavigationWatch::default()
             .observe(
                 &expected,
@@ -1059,11 +1323,7 @@ mod tests {
                 Duration::from_secs(5)
             )
             .is_err());
-        for roots in [
-            vec![],
-            vec![extra],
-            vec![DesktopReceipt { pid: 10, birth: 21 }],
-        ] {
+        for roots in [vec![], vec![extra], vec![synthetic_receipt(10, 21)]] {
             assert!(NavigationWatch::default()
                 .observe(&expected, &roots, Duration::ZERO)
                 .is_err());
@@ -1080,7 +1340,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_during_navigation_wait_prevents_continuation() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let expected = DesktopReceipt { pid: 10, birth: 20 };
+        let expected = synthetic_receipt(10, 20);
         let checks = AtomicUsize::new(0);
         let inspections = AtomicUsize::new(0);
         let result = wait_for_navigation_with(
@@ -1094,10 +1354,7 @@ mod tests {
             },
             || {
                 inspections.fetch_add(1, Ordering::SeqCst);
-                Ok(vec![
-                    expected.clone(),
-                    DesktopReceipt { pid: 11, birth: 21 },
-                ])
+                Ok(vec![expected.clone(), synthetic_receipt(11, 21)])
             },
         )
         .await;
@@ -1110,16 +1367,285 @@ mod tests {
 
     #[test]
     fn a_reopened_desktop_invalidates_the_inventory_before_any_pause() {
-        let original = Some(DesktopReceipt { pid: 10, birth: 20 });
+        let original = Some(synthetic_receipt(10, 20));
         assert!(validate_same_desktop(&original, &original).is_ok());
         for changed in [
             None,
-            Some(DesktopReceipt { pid: 11, birth: 20 }),
-            Some(DesktopReceipt { pid: 10, birth: 21 }),
+            Some(synthetic_receipt(11, 20)),
+            Some(synthetic_receipt(10, 21)),
         ] {
             assert!(validate_same_desktop(&original, &changed).is_err());
         }
         assert!(validate_same_desktop(&None, &original).is_err());
+    }
+
+    fn synthetic_desktop(pid: u32, birth: u64) -> Desktop {
+        Desktop {
+            pid,
+            birth,
+            family: "OpenAI.Codex_test".into(),
+            application_id: "OpenAI.Codex_test!App".into(),
+        }
+    }
+
+    fn synthetic_receipt(pid: u32, birth: u64) -> DesktopReceipt {
+        receipt_for(&[synthetic_desktop(pid, birth)]).unwrap()
+    }
+
+    #[test]
+    fn same_package_independent_roots_are_bound_and_all_closed_before_enable() {
+        let roots = vec![synthetic_desktop(10, 20), synthetic_desktop(30, 40)];
+        let mut fake = Fake::new();
+        fake.extra_roots.push(roots[1].clone());
+        let closed = fake.closed.clone();
+        let mut runtime = BoundRuntime {
+            inner: fake,
+            expected: receipt_for(&roots),
+        };
+        let enables = Cell::new(0);
+        assert!(restart_with_action_mode(
+            &mut runtime,
+            &|| Ok(()),
+            || {
+                assert!(closed.get());
+                enables.set(enables.get() + 1);
+                Ok(())
+            },
+            false
+        )
+        .unwrap());
+        assert_eq!(runtime.inner.close_targets, roots);
+        assert_eq!(enables.get(), 1);
+        assert_eq!(
+            runtime.inner.events,
+            ["inspect", "close-confirm", "activate-confirm"]
+        );
+        assert!(runtime.inner.extra_roots.is_empty());
+    }
+
+    #[test]
+    fn changed_root_set_invalidates_all_close_targets() {
+        let first = synthetic_desktop(10, 20);
+        let second = synthetic_desktop(30, 40);
+        let expected = receipt_for(&[first.clone(), second.clone()]);
+        for changed in [
+            vec![],
+            vec![synthetic_desktop(30, 41)],
+            vec![synthetic_desktop(31, 40)],
+            vec![second.clone(), synthetic_desktop(50, 60)],
+        ] {
+            let mut fake = Fake::new();
+            fake.extra_roots = changed;
+            let mut runtime = BoundRuntime {
+                inner: fake,
+                expected: expected.clone(),
+            };
+            assert!(restart_with_action_mode(
+                &mut runtime,
+                &|| Ok(()),
+                || panic!("must not enable"),
+                false
+            )
+            .is_err());
+            assert_eq!(runtime.inner.events, ["inspect"]);
+            assert!(runtime.inner.close_targets.is_empty());
+        }
+        // Serialized wait receipts preserve every root and ignore enumeration
+        // ordering; user close/reopen of either root still invalidates them.
+        let encoded = serde_json::to_string(&expected).unwrap();
+        let decoded: Option<DesktopReceipt> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, expected);
+        assert_eq!(receipt_for(&[second, first]), expected);
+    }
+
+    #[test]
+    fn foreign_package_or_application_never_joins_shutdown_group() {
+        let first = synthetic_desktop(10, 20);
+        for foreign in [
+            Desktop {
+                family: "OpenAI.Codex_other".into(),
+                ..synthetic_desktop(30, 40)
+            },
+            Desktop {
+                application_id: "OpenAI.Codex_test!Other".into(),
+                ..synthetic_desktop(30, 40)
+            },
+            synthetic_desktop(10, 21),
+        ] {
+            let mut fake = Fake::new();
+            fake.extra_roots.push(foreign.clone());
+            assert!(validate_restart_roots(&[first.clone(), foreign]).is_err());
+            assert!(restart_with_action_mode(
+                &mut fake,
+                &|| Ok(()),
+                || panic!("must not enable"),
+                false
+            )
+            .is_err());
+            assert_eq!(fake.events, ["inspect"]);
+            assert!(fake.close_targets.is_empty());
+        }
+    }
+
+    #[test]
+    fn rm_list_must_match_all_registered_births_exactly() {
+        let expected = [(10, 20), (30, 40)];
+        assert!(same_process_set(&expected, &[(30, 40), (10, 20)]));
+        for actual in [
+            vec![(10, 20)],
+            vec![(10, 20), (30, 41)],
+            vec![(10, 20), (30, 40), (50, 60)],
+            vec![(10, 20), (10, 20)],
+            vec![(10, 20), (10, 40)],
+        ] {
+            assert!(!same_process_set(&expected, &actual));
+        }
+    }
+
+    #[test]
+    fn transient_handoff_settles_but_persistent_multi_root_is_supported() {
+        use std::time::Duration;
+        let first = synthetic_desktop(10, 20);
+        let second = synthetic_desktop(30, 40);
+        let mut handoff = DesktopSettleWatch::default();
+        assert!(!handoff
+            .observe(&[first.clone(), second.clone()], Duration::ZERO)
+            .unwrap());
+        assert!(!handoff
+            .observe(&[first.clone()], Duration::from_millis(100))
+            .unwrap());
+        assert!(handoff
+            .observe(&[first.clone()], Duration::from_millis(350))
+            .unwrap());
+        let roots = [first.clone(), second];
+        let mut persistent = DesktopSettleWatch::default();
+        assert!(!persistent.observe(&roots, Duration::ZERO).unwrap());
+        assert!(!persistent
+            .observe(&roots, Duration::from_millis(300))
+            .unwrap());
+        assert!(persistent.observe(&roots, Duration::from_secs(2)).unwrap());
+        let mut changing = DesktopSettleWatch::default();
+        assert!(!changing
+            .observe(&[first], Duration::from_millis(1900))
+            .unwrap());
+        assert!(changing.observe(&roots, Duration::from_secs(2)).is_err());
+    }
+
+    #[test]
+    fn chatgpt_parent_from_another_package_is_a_separate_root() {
+        let parent = synthetic_desktop(10, 20);
+        let child = Desktop {
+            family: "OpenAI.Codex_other".into(),
+            application_id: "OpenAI.Codex_other!App".into(),
+            ..synthetic_desktop(30, 40)
+        };
+        let rows = [
+            DesktopProcessRow {
+                desktop: parent.clone(),
+                parent_pid: 1,
+            },
+            DesktopProcessRow {
+                desktop: child.clone(),
+                parent_pid: 10,
+            },
+        ];
+        let roots = root_desktops_from_rows(&rows);
+        assert_eq!(roots, [parent, child]);
+        assert!(validate_restart_roots(&roots).is_err());
+    }
+
+    #[test]
+    fn descendants_of_one_root_are_one_desktop() {
+        let rows = vec![
+            DesktopProcessRow {
+                desktop: synthetic_desktop(10, 100),
+                parent_pid: 1,
+            },
+            DesktopProcessRow {
+                desktop: synthetic_desktop(20, 200),
+                parent_pid: 10,
+            },
+            DesktopProcessRow {
+                desktop: synthetic_desktop(30, 300),
+                parent_pid: 20,
+            },
+        ];
+        assert_eq!(
+            root_desktops_from_rows(&rows),
+            vec![synthetic_desktop(10, 100)]
+        );
+        assert_eq!(
+            receipt_for(&root_desktops_from_rows(&rows))
+                .unwrap()
+                .root_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn independent_roots_remain_explicitly_multiple() {
+        let rows = vec![
+            DesktopProcessRow {
+                desktop: synthetic_desktop(10, 100),
+                parent_pid: 1,
+            },
+            DesktopProcessRow {
+                desktop: synthetic_desktop(20, 200),
+                parent_pid: 2,
+            },
+            DesktopProcessRow {
+                desktop: synthetic_desktop(30, 300),
+                parent_pid: 10,
+            },
+        ];
+        assert_eq!(
+            root_desktops_from_rows(&rows),
+            vec![synthetic_desktop(10, 100), synthetic_desktop(20, 200)]
+        );
+        assert_eq!(
+            receipt_for(&root_desktops_from_rows(&rows))
+                .unwrap()
+                .root_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn reused_parent_pid_is_not_treated_as_ancestry() {
+        let rows = vec![
+            DesktopProcessRow {
+                desktop: synthetic_desktop(10, 500),
+                parent_pid: 1,
+            },
+            // PID 10 was reused after this child was born. It is an
+            // independent desktop, not a renderer below the first root.
+            DesktopProcessRow {
+                desktop: synthetic_desktop(20, 400),
+                parent_pid: 10,
+            },
+        ];
+        assert_eq!(
+            root_desktops_from_rows(&rows),
+            vec![synthetic_desktop(10, 500), synthetic_desktop(20, 400)]
+        );
+    }
+
+    #[test]
+    fn malformed_parent_cycle_fails_closed_as_multiple_roots() {
+        let rows = vec![
+            DesktopProcessRow {
+                desktop: synthetic_desktop(10, 100),
+                parent_pid: 20,
+            },
+            DesktopProcessRow {
+                desktop: synthetic_desktop(20, 200),
+                parent_pid: 10,
+            },
+        ];
+        assert_eq!(
+            root_desktops_from_rows(&rows),
+            vec![synthetic_desktop(10, 100), synthetic_desktop(20, 200)]
+        );
     }
 
     struct Fake {
@@ -1129,6 +1655,8 @@ mod tests {
         start_failure: bool,
         closed: Rc<Cell<bool>>,
         pending: Option<Desktop>,
+        extra_roots: Vec<Desktop>,
+        close_targets: Vec<Desktop>,
     }
     impl Fake {
         fn new() -> Self {
@@ -1139,6 +1667,8 @@ mod tests {
                 start_failure: false,
                 closed: Rc::new(Cell::new(false)),
                 pending: None,
+                extra_roots: vec![],
+                close_targets: vec![],
             }
         }
     }
@@ -1147,10 +1677,7 @@ mod tests {
     fn snapshot_of_old_desktop_cannot_close_a_user_reopened_desktop() {
         let mut runtime = BoundRuntime {
             inner: Fake::new(),
-            expected: Some(DesktopReceipt {
-                pid: u32::MAX,
-                birth: 1,
-            }),
+            expected: Some(synthetic_receipt(u32::MAX, 1)),
         };
         assert!(restart_with_action_mode(
             &mut runtime,
@@ -1187,21 +1714,23 @@ mod tests {
         fn clear_pending_desktop(&mut self) {
             self.pending = None;
         }
-        fn running_desktop(&mut self) -> Result<Option<Desktop>, String> {
+        fn running_desktops(&mut self) -> Result<Vec<Desktop>, String> {
             self.events.push("inspect");
-            Ok(self.running.then(|| Desktop {
-                pid: 10,
-                birth: 20,
-                family: "OpenAI.Codex_test".into(),
-                application_id: "OpenAI.Codex_test!App".into(),
-            }))
+            if self.running {
+                let mut roots = vec![synthetic_desktop(10, 20)];
+                roots.extend(self.extra_roots.clone());
+                Ok(roots)
+            } else {
+                Ok(vec![])
+            }
         }
         fn close_and_confirm(
             &mut self,
-            _: &Desktop,
+            desktops: &[Desktop],
             _: &dyn Fn() -> Result<(), String>,
         ) -> Result<(), String> {
             self.events.push("close-confirm");
+            self.close_targets = desktops.to_vec();
             if self.close_failure {
                 Err("not exited".into())
             } else {
@@ -1220,6 +1749,7 @@ mod tests {
                 Err("activation failed".into())
             } else {
                 self.running = true;
+                self.extra_roots.clear();
                 Ok(())
             }
         }

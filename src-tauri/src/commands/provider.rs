@@ -136,6 +136,9 @@ fn switch_provider_internal(
     id: &str,
     requested_generation: Option<u64>,
 ) -> Result<(SwitchResult, Option<u64>), AppError> {
+    let previous_provider = (app_type == AppType::Codex)
+        .then(|| ProviderService::current(state, AppType::Codex).ok())
+        .flatten();
     let generation = if app_type == AppType::Codex {
         // Manual account selection retains the original service behavior even
         // when the optional automatic desktop lifecycle is unavailable.
@@ -147,15 +150,40 @@ fn switch_provider_internal(
     } else {
         None
     };
+    if let Some(generation) = generation {
+        crate::services::codex_auto_switch::set_manual_activation_context(
+            generation,
+            previous_provider.clone(),
+            id,
+        );
+    }
+    let operation_id =
+        generation.and_then(crate::services::codex_auto_switch::operation_id_for_generation);
     let activation = match generation {
         Some(generation) => {
             crate::services::codex_auto_switch::activate_reserved_account(state, id, generation)
         }
-        None => ProviderService::switch(state, app_type, id),
+        None => ProviderService::switch(state, app_type.clone(), id),
     };
     match activation {
         Ok(result) => Ok((result, generation)),
         Err(error) => {
+            // Capture before releasing the reservation: finish clears the
+            // operation UUID, and a later user selection can change current.
+            if app_type == AppType::Codex {
+                crate::services::codex_switch_history::record_failure_now_with_context(
+                    "failed",
+                    &error.to_string(),
+                    previous_provider.as_deref(),
+                    Some(id),
+                    crate::services::codex_switch_history::FailureContext {
+                        operation_id: operation_id.as_deref(),
+                        source: Some("manual"),
+                        stage: Some("enabling"),
+                        candidate_failures: &[],
+                    },
+                );
+            }
             if let Some(generation) = generation {
                 crate::services::codex_auto_switch::finish_manual_operation(generation);
             }
@@ -197,19 +225,62 @@ pub async fn switch_provider(
     } else {
         None
     };
+    let activation_source_provider = generation.and_then(|_| {
+        app_handle
+            .try_state::<AppState>()
+            .and_then(|state| ProviderService::current(state.inner(), AppType::Codex).ok())
+    });
+    let activation_operation_id =
+        generation.and_then(crate::services::codex_auto_switch::operation_id_for_generation);
     let selected_id = id.clone();
     let switch_app = app_handle.clone();
+    let worker_source_provider = activation_source_provider.clone();
+    let worker_operation_id = activation_operation_id.clone();
     let activation_result = tauri::async_runtime::spawn_blocking(move || {
-        let state = switch_app
-            .try_state::<AppState>()
-            .ok_or_else(|| "应用状态不可用".to_string())?;
+        let state = match switch_app.try_state::<AppState>() {
+            Some(state) => state,
+            None => {
+                if generation.is_some() {
+                    crate::services::codex_switch_history::record_failure_now_with_context(
+                        "failed",
+                        "应用状态不可用",
+                        worker_source_provider.as_deref(),
+                        Some(&id),
+                        crate::services::codex_switch_history::FailureContext {
+                            operation_id: worker_operation_id.as_deref(),
+                            source: Some("manual"),
+                            stage: Some("state-read"),
+                            candidate_failures: &[],
+                        },
+                    );
+                }
+                return Err("应用状态不可用".to_string());
+            }
+        };
         let (result, generation) =
             switch_provider_internal(state.inner(), app_type, &id, generation)
                 .map_err(|e| e.to_string())?;
         Ok::<_, String>((result, generation))
     })
     .await
-    .map_err(|e| format!("供应商切换任务执行失败: {e}"))
+    .map_err(|e| {
+        let error = format!("供应商切换任务执行失败: {e}");
+        if generation.is_some() {
+            crate::services::codex_switch_history::record_failure_now_with_context(
+                "failed",
+                &error,
+                activation_source_provider.as_deref(),
+                Some(&selected_id),
+                crate::services::codex_switch_history::FailureContext {
+                    operation_id: activation_operation_id.as_deref(),
+                    source: Some("manual"),
+                    stage: Some("activation-worker"),
+                    candidate_failures: &[],
+                },
+            );
+        }
+        error
+    })
     .and_then(|result| result);
     let (mut result, generation) = match activation_result {
         Ok(result) => result,
@@ -1440,6 +1511,55 @@ mod manual_codex_switch_tests {
             ..ProviderMeta::default()
         });
         provider
+    }
+
+    #[test]
+    #[serial]
+    fn manual_activation_failure_is_recorded_once_with_source_target_and_operation() {
+        let _home = TestHome::new();
+        let state = AppState::new(Arc::new(Database::memory().expect("memory database")));
+        state
+            .db
+            .save_provider("codex", &managed_provider("provider-a", "account-a"))
+            .unwrap();
+        state
+            .db
+            .set_current_provider("codex", "provider-a")
+            .unwrap();
+        let generation = crate::services::codex_auto_switch::invalidate_pending_with_generation(
+            "test activation",
+        );
+        let operation =
+            crate::services::codex_auto_switch::operation_id_for_generation(generation).unwrap();
+
+        switch_provider_internal(&state, AppType::Codex, "missing-target", Some(generation))
+            .expect_err("a missing provider cannot activate");
+
+        let records = crate::services::codex_switch_history::records().unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "the same activation failure is not logged twice"
+        );
+        assert_eq!(records[0].operation_id.as_deref(), Some(operation.as_str()));
+        assert_eq!(records[0].source.as_deref(), Some("manual"));
+        assert_eq!(records[0].stage.as_deref(), Some("enabling"));
+        assert_eq!(
+            records[0].current_provider_id.as_deref(),
+            Some("provider-a")
+        );
+        assert_eq!(
+            records[0].target_provider_id.as_deref(),
+            Some("missing-target")
+        );
+        assert!(records[0].reason.contains("不存在"));
+        assert_eq!(
+            state.db.get_current_provider("codex").unwrap().as_deref(),
+            Some("provider-a")
+        );
+        assert!(
+            crate::services::codex_auto_switch::operation_id_for_generation(generation).is_none()
+        );
     }
 
     #[test]

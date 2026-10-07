@@ -11,7 +11,7 @@ blocked_directories = {
     '.codex', '.cc-switch', 'credential-backup', 'codex-desktop-recovery',
     'node_modules', 'target', 'dist', 'work', 'outputs', 'backups',
 }
-blocked_names = {'auth.json', 'codex_oauth_auth.json', 'codex_managed_oauth_live_auth.json'}
+blocked_names = {'auth.json', 'codex_oauth_auth.json', 'codex_managed_oauth_live_auth.json', 'codex-auto-switch-failures.json'}
 blocked_extensions = {'.db', '.db-wal', '.db-shm', '.sqlite', '.sqlite3', '.pdb', '.lnk', '.exe', '.dll', '.pem', '.p12', '.pfx'}
 patterns = {
     'private-key': re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----'),

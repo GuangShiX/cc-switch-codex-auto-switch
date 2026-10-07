@@ -1380,6 +1380,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             crate::services::codex_auto_switch::get_codex_auto_switch_status,
+            crate::services::codex_switch_history::get_codex_auto_switch_failure_history,
             crate::services::codex_auto_switch::set_codex_auto_switch_enabled,
             crate::services::codex_auto_switch::cancel_codex_auto_switch,
             commands::get_providers,

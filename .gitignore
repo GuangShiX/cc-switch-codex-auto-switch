@@ -34,6 +34,7 @@ mainWindow.js
 **/auth.json
 **/codex_oauth_auth.json
 **/codex_managed_oauth_live_auth.json
+**/codex-auto-switch-failures.json
 **/codex-desktop-recovery/
 **/*.db
 **/*.db-wal

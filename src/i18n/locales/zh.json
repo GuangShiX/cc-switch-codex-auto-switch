@@ -9,12 +9,23 @@
     "checkedAccount": "本次检查账号",
     "target": "目标账号",
     "lastChecked": "最近额度检查",
+    "waitUntil": "最早 5 小时额度重置",
     "candidateFailures": "账号不可用原因",
+    "failureHistory": "最近切换失败记录",
+    "historyUnavailable": "切换失败记录读取失败",
+    "refreshHistory": "重新读取失败记录",
+    "waitPolicy": "没有可用账号时，切至周额度仍可用且 5 小时窗口最早重置的账号，保存本次原任务等待。重置后重新查询，确认额度可用才继续，等待期间不反复重启。",
+    "sources": {
+      "manual": "手动启用",
+      "automatic": "自动检测",
+      "reset-wait": "等待重置"
+    },
     "statusUnavailable": "无法读取后台状态",
     "loading": "正在读取后台状态",
     "refreshStatus": "重新读取状态",
     "phases": {
       "waiting": "等待可用账号",
+      "waiting-for-reset": "等待 5 小时额度重置",
       "monitoring": "正在后台监测",
       "checking": "正在查询当前账号额度",
       "selecting": "正在选择 5 小时剩余额度最多的账号",

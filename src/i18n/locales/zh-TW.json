@@ -9,12 +9,23 @@
     "checkedAccount": "本次檢查帳號",
     "target": "目標帳號",
     "lastChecked": "最近額度檢查",
+    "waitUntil": "最早 5 小時額度重置",
     "candidateFailures": "帳號無法使用的原因",
+    "failureHistory": "最近切換失敗記錄",
+    "historyUnavailable": "切換失敗記錄讀取失敗",
+    "refreshHistory": "重新讀取失敗記錄",
+    "waitPolicy": "沒有可用帳號時，切至週額度仍可用且 5 小時視窗最早重置的帳號，儲存本次原任務等待。重置後重新查詢，確認額度可用才繼續，等待期間不反覆重啟。",
+    "sources": {
+      "manual": "手動啟用",
+      "automatic": "自動檢查",
+      "reset-wait": "等待重置"
+    },
     "statusUnavailable": "無法讀取背景狀態",
     "loading": "正在讀取背景狀態",
     "refreshStatus": "重新讀取狀態",
     "phases": {
       "waiting": "等待可用帳號",
+      "waiting-for-reset": "等待 5 小時額度重置",
       "monitoring": "正在背景監測",
       "checking": "正在查詢目前帳號額度",
       "selecting": "正在選擇 5 小時剩餘額度最多的帳號",

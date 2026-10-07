@@ -9,12 +9,23 @@
     "checkedAccount": "今回確認したアカウント",
     "target": "切替先のアカウント",
     "lastChecked": "前回の利用枠確認",
+    "waitUntil": "最も早い5時間枠のリセット",
     "candidateFailures": "アカウントを利用できない理由",
+    "failureHistory": "最近の切り替え失敗",
+    "historyUnavailable": "切り替え失敗履歴を取得できません",
+    "refreshHistory": "失敗履歴を再取得",
+    "waitPolicy": "利用可能なアカウントがなければ、週間枠が残り、5時間枠のリセットが最も早いアカウントを選び、今回のタスクを保存して待機します。リセット後に再確認し、利用枠が回復してから再開します。待機中に再起動を繰り返しません。",
+    "sources": {
+      "manual": "手動の有効化",
+      "automatic": "自動確認",
+      "reset-wait": "リセット待機"
+    },
     "statusUnavailable": "バックグラウンドの状態を取得できません",
     "loading": "バックグラウンドの状態を取得中",
     "refreshStatus": "状態を再取得",
     "phases": {
       "waiting": "利用可能なアカウントを待機中",
+      "waiting-for-reset": "5時間枠のリセットを待機中",
       "monitoring": "バックグラウンドで監視中",
       "checking": "現在のアカウントの利用枠を確認中",
       "selecting": "5時間枠の残りが最も多いアカウントを選択中",

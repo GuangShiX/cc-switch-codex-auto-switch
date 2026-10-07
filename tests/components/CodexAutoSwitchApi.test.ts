@@ -13,8 +13,18 @@ describe("Codex auto switch native command contract", () => {
       candidateFailures: [],
       canCancel: false,
     };
+    const nativeFailureHistory = [
+      {
+        at: 1791000000000,
+        phase: "closing",
+        reason: "检测到多个 Codex 桌面窗口，未关闭桌面",
+        currentProviderId: "current",
+        targetProviderId: "target",
+      },
+    ];
     for (const command of [
       "get_codex_auto_switch_status",
+      "get_codex_auto_switch_failure_history",
       "set_codex_auto_switch_enabled",
       "cancel_codex_auto_switch",
     ]) {
@@ -22,19 +32,27 @@ describe("Codex auto switch native command contract", () => {
         http.post(`http://tauri.local/${command}`, async ({ request }) => {
           calls(command, await request.json());
           return HttpResponse.json(
-            command === "get_codex_auto_switch_status" ? nativeStatus : null,
+            command === "get_codex_auto_switch_status"
+              ? nativeStatus
+              : command === "get_codex_auto_switch_failure_history"
+                ? nativeFailureHistory
+                : null,
           );
         }),
       );
     }
 
     expect(await codexAutoSwitchApi.getStatus()).toEqual(nativeStatus);
+    expect(await codexAutoSwitchApi.getFailureHistory()).toEqual(
+      nativeFailureHistory,
+    );
     await codexAutoSwitchApi.setEnabled(true);
     await codexAutoSwitchApi.setEnabled(false);
     await codexAutoSwitchApi.cancel();
 
     expect(calls.mock.calls).toEqual([
       ["get_codex_auto_switch_status", {}],
+      ["get_codex_auto_switch_failure_history", {}],
       ["set_codex_auto_switch_enabled", { enabled: true }],
       ["set_codex_auto_switch_enabled", { enabled: false }],
       ["cancel_codex_auto_switch", {}],

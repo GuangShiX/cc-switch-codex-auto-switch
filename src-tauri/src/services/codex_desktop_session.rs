@@ -15,7 +15,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const PIPE_NAME: &str = r"\\.\pipe\codex-ipc";
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+// Desktop state includes the loaded chat snapshot even though we retain only
+// metadata. Long running chats can legitimately exceed 16 MiB. Keep a bounded
+// transport allowance and immediately discard bodies after projection.
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
@@ -85,6 +88,30 @@ pub struct TaskContext {
     pub current_permissions: Value,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum WaitingReason {
+    PendingApproval,
+    PendingUserInput,
+    PendingElicitation,
+    UnknownRequest,
+    UnknownRuntimeFlag,
+    UnconfirmedTurnSubmission,
+}
+
+impl WaitingReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingApproval => "pendingApproval",
+            Self::PendingUserInput => "pendingUserInput",
+            Self::PendingElicitation => "pendingElicitation",
+            Self::UnknownRequest => "unknownRequest",
+            Self::UnknownRuntimeFlag => "unknownRuntimeFlag",
+            Self::UnconfirmedTurnSubmission => "unconfirmedTurnSubmission",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskSnapshot {
@@ -99,6 +126,8 @@ pub struct TaskSnapshot {
     pub turn_ended_at_ms: Option<i64>,
     pub runtime_status: String,
     pub waiting: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_reason: Option<WaitingReason>,
     pub is_child: bool,
     pub ephemeral: bool,
     pub client_user_message_id: Option<String>,
@@ -134,8 +163,8 @@ impl TaskSnapshot {
             && !self.ephemeral
     }
 
-    /// Old quota errors are safe to leave stopped while restarting, but they
-    /// are not permission to resume a task the user abandoned earlier.
+    /// Capture recent failures only. Once captured, an exact owned ticket can
+    /// survive a long reset wait; an old unrelated failure is not new consent.
     pub fn recent_quota_failure(&self) -> bool {
         wall_clock_ms().is_some_and(|now| self.recent_quota_failure_at(now))
     }
@@ -1299,7 +1328,7 @@ fn checked_length(length: usize) -> Result<(), SessionError> {
     if length == 0 || length > MAX_FRAME_BYTES {
         Err(SessionError::new(
             SessionErrorKind::Incompatible,
-            "Codex 桌面协议帧长度无效",
+            format!("Codex 桌面状态消息大小无效（{length} 字节，上限 {MAX_FRAME_BYTES} 字节）；未继续操作"),
         ))
     } else {
         Ok(())
@@ -1755,7 +1784,8 @@ fn project_at(path: &[String], value: &Value) -> Option<Value> {
                 None
             }
         }
-        "requests" | "unconfirmedTurnSubmissions" => Some(if path.len() == 1 {
+        "requests" => project_request_path(&path[1..], value, true),
+        "unconfirmedTurnSubmissions" => Some(if path.len() == 1 {
             Value::Array(
                 value
                     .as_array()
@@ -1768,20 +1798,15 @@ fn project_at(path: &[String], value: &Value) -> Option<Value> {
         "threadRuntimeStatus" => {
             if path.len() == 1 {
                 Some(
-                    json!({"type":value["type"],"activeFlags":value["activeFlags"].as_array().map(|items| items.iter().map(|_| json!({})).collect::<Vec<_>>()).unwrap_or_default()}),
+                    json!({"type":value["type"],"activeFlags":project_active_flags(&value["activeFlags"])}),
                 )
             } else if path.get(1).map(String::as_str) == Some("type") {
                 Some(value.clone())
             } else if path.get(1).map(String::as_str) == Some("activeFlags") {
                 Some(if path.len() == 2 {
-                    Value::Array(
-                        value
-                            .as_array()
-                            .map(|items| items.iter().map(|_| json!({})).collect())
-                            .unwrap_or_default(),
-                    )
+                    project_active_flags(value)
                 } else {
-                    json!({})
+                    project_active_flag(value)
                 })
             } else {
                 None
@@ -1791,6 +1816,194 @@ fn project_at(path: &[String], value: &Value) -> Option<Value> {
         "turnHistory" => project_history_path(&path[1..], value),
         _ => None,
     }
+}
+
+/// A request array also contains plan implementation prompts and automatic
+/// requests. Preserve only the enums needed to distinguish them from an
+/// unanswered approval/input. No command, question, options or tool arguments
+/// survive projection (apart from the fixed setup-step completion marker).
+fn project_request_path(path: &[String], value: &Value, is_array: bool) -> Option<Value> {
+    if is_array && path.is_empty() {
+        return Some(match value.as_array() {
+            Some(items) => Value::Array(
+                items
+                    .iter()
+                    .filter_map(|request| project_request_path(&[], request, false))
+                    .collect(),
+            ),
+            None if value.is_null() => json!([]),
+            None => json!([{"method":"unknown"}]),
+        });
+    }
+    if is_array {
+        return project_request_path(&path[1..], value, false);
+    }
+    if path.is_empty() {
+        return Some(json!({
+            "method":project_request_method(&value["method"]),
+            "completed":value["completed"].as_bool(),
+            "params":project_request_params(&[], &value["params"])
+        }));
+    }
+    match path[0].as_str() {
+        "method" if path.len() == 1 => Some(project_request_method(value)),
+        "completed" if path.len() == 1 => Some(json!(value.as_bool())),
+        "params" => project_request_params(&path[1..], value),
+        _ => None,
+    }
+}
+
+fn project_request_method(value: &Value) -> Value {
+    json!(match value.as_str() {
+        Some(
+            method @ ("item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "item/tool/requestOptionPicker"
+            | "item/tool/call"
+            | "mcpServer/elicitation/request"
+            | "item/plan/requestImplementation"
+            | "currentTime/read"
+            | "account/chatgptAuthTokens/refresh"
+            | "attestation/generate"
+            | "applyPatchApproval"
+            | "execCommandApproval"),
+        ) => method,
+        _ => "unknown",
+    })
+}
+
+fn project_request_tool(value: &Value) -> Value {
+    json!(match value.as_str() {
+        Some(
+            tool @ ("request_environment_input"
+            | "request_onboarding_input"
+            | "request_option_picker"
+            | "setup_codex_step"),
+        ) => tool,
+        _ => "unknown",
+    })
+}
+
+fn project_request_namespace(value: &Value) -> Value {
+    if value.is_null() {
+        Value::Null
+    } else {
+        json!(if value.as_str() == Some("codex_app") {
+            "codex_app"
+        } else {
+            "unknown"
+        })
+    }
+}
+
+fn project_setup_step(value: &Value) -> Value {
+    json!(if value.as_str() == Some("complete") {
+        "complete"
+    } else {
+        "unknown"
+    })
+}
+
+fn project_request_params(path: &[String], value: &Value) -> Option<Value> {
+    if path.is_empty() {
+        return Some(json!({
+            "turnId":value["turnId"].as_str(),
+            "tool":project_request_tool(&value["tool"]),
+            "namespace":project_request_namespace(&value["namespace"]),
+            "arguments":{"step":project_setup_step(&value["arguments"]["step"])}
+        }));
+    }
+    match path[0].as_str() {
+        "turnId" if path.len() == 1 => Some(json!(value.as_str())),
+        "tool" if path.len() == 1 => Some(project_request_tool(value)),
+        "namespace" if path.len() == 1 => Some(project_request_namespace(value)),
+        "arguments" if path.len() == 1 => Some(json!({"step":project_setup_step(&value["step"])})),
+        "arguments" if path.len() == 2 && path[1] == "step" => Some(project_setup_step(value)),
+        _ => None,
+    }
+}
+
+fn project_active_flag(value: &Value) -> Value {
+    json!(match value.as_str() {
+        Some(flag @ ("waitingOnApproval" | "waitingOnUserInput")) => flag,
+        _ => "unknown",
+    })
+}
+
+fn project_active_flags(value: &Value) -> Value {
+    match value.as_array() {
+        Some(flags) => Value::Array(flags.iter().map(project_active_flag).collect()),
+        None if value.is_null() => json!([]),
+        None => json!(["unknown"]),
+    }
+}
+
+fn pending_request_reason(requests: &Value) -> Option<WaitingReason> {
+    requests.as_array().and_then(|requests| {
+        requests.iter().find_map(|request| {
+            match request["method"].as_str() {
+                // The desktop keeps this prompt after a completed turn and
+                // explicitly treats it as idle rather than approval/input.
+                Some(
+                    "item/plan/requestImplementation"
+                    | "currentTime/read"
+                    | "account/chatgptAuthTokens/refresh"
+                    | "attestation/generate",
+                ) => None,
+                Some("mcpServer/elicitation/request") => (request["completed"].as_bool()
+                    != Some(true))
+                .then_some(WaitingReason::PendingElicitation),
+                Some("item/tool/call")
+                    if request["params"]["tool"].as_str() == Some("setup_codex_step")
+                        && (request["params"]["namespace"].is_null()
+                            || request["params"]["namespace"].as_str() == Some("codex_app"))
+                        && request["params"]["arguments"]["step"].as_str() == Some("complete") =>
+                {
+                    None
+                }
+                Some(
+                    "item/commandExecution/requestApproval"
+                    | "item/fileChange/requestApproval"
+                    | "item/permissions/requestApproval"
+                    | "applyPatchApproval"
+                    | "execCommandApproval",
+                ) => Some(WaitingReason::PendingApproval),
+                Some("item/tool/requestUserInput" | "item/tool/requestOptionPicker") => {
+                    Some(WaitingReason::PendingUserInput)
+                }
+                Some("item/tool/call")
+                    if (request["params"]["namespace"].is_null()
+                        || request["params"]["namespace"].as_str() == Some("codex_app"))
+                        && matches!(
+                            request["params"]["tool"].as_str(),
+                            Some(
+                                "request_environment_input"
+                                    | "request_onboarding_input"
+                                    | "request_option_picker"
+                                    | "setup_codex_step"
+                            )
+                        ) =>
+                {
+                    Some(WaitingReason::PendingUserInput)
+                }
+                // Known approval/input and new or malformed contracts remain
+                // blocked. A request from an older turn can still be visible.
+                _ => Some(WaitingReason::UnknownRequest),
+            }
+        })
+    })
+}
+
+fn runtime_flag_reason(flags: &Value) -> Option<WaitingReason> {
+    flags.as_array().and_then(|flags| {
+        flags.iter().find_map(|flag| match flag.as_str() {
+            Some("waitingOnApproval") => Some(WaitingReason::PendingApproval),
+            Some("waitingOnUserInput") => Some(WaitingReason::PendingUserInput),
+            _ => Some(WaitingReason::UnknownRuntimeFlag),
+        })
+    })
 }
 
 fn project_turn_path(path: &[String], value: &Value, is_array: bool) -> Option<Value> {
@@ -2058,6 +2271,12 @@ fn summarize(state: &Value, owner: &str) -> Option<TaskSnapshot> {
             .map(|items| !items.is_empty())
             .unwrap_or(false)
     };
+    let waiting_reason = pending_request_reason(&state["requests"])
+        .or_else(|| runtime_flag_reason(&state["threadRuntimeStatus"]["activeFlags"]))
+        .or_else(|| {
+            nonempty(&state["unconfirmedTurnSubmissions"])
+                .then_some(WaitingReason::UnconfirmedTurnSubmission)
+        });
     Some(TaskSnapshot {
         thread_id: state["id"].as_str()?.into(),
         owner: owner.into(),
@@ -2074,9 +2293,8 @@ fn summarize(state: &Value, owner: &str) -> Option<TaskSnapshot> {
             .and_then(Value::as_str)
             .unwrap_or("unknown")
             .into(),
-        waiting: nonempty(&state["requests"])
-            || nonempty(&state["threadRuntimeStatus"]["activeFlags"])
-            || nonempty(&state["unconfirmedTurnSubmissions"]),
+        waiting: waiting_reason.is_some(),
+        waiting_reason,
         is_child: state["agentNickname"]
             .as_str()
             .map(|value| !value.is_empty())
@@ -2207,6 +2425,221 @@ mod tests {
         )
         .unwrap();
         assert!(!summarize(&metadata, "owner").unwrap().safely_quota_failed());
+    }
+
+    #[test]
+    fn quota_failed_noninteractive_request_metadata_does_not_look_like_approval() {
+        let mut value = quota_failed_state();
+        value["requests"] = json!([
+            {"method":"item/plan/requestImplementation",
+                "params":{"turnId":"older-turn","planContent":"private plan"}},
+            {"method":"currentTime/read","params":{"private":"private time"}},
+            {"method":"account/chatgptAuthTokens/refresh",
+                "params":{"refreshToken":"private credential"}},
+            {"method":"attestation/generate","params":{"nonce":"private nonce"}},
+            {"method":"mcpServer/elicitation/request","completed":true,
+                "params":{"message":"private elicitation"}},
+            {"method":"item/tool/call","params":{"tool":"setup_codex_step",
+                "arguments":{"step":"complete","message":"private setup"}}}
+        ]);
+        let metadata = project_at(&[], &value).unwrap();
+        let task = summarize(&metadata, "owner").unwrap();
+        assert!(!task.waiting);
+        assert_eq!(task.waiting_reason, None);
+        assert!(task.safely_quota_failed());
+        assert!(task.matches_paused(&quota_ticket()));
+        assert!(matches_reopened_pause(&task, &quota_ticket()));
+        let encoded = serde_json::to_string(&metadata).unwrap();
+        assert!(!encoded.contains("private"));
+        assert!(!encoded.contains("refreshToken"));
+        assert!(!encoded.contains("planContent"));
+    }
+
+    #[test]
+    fn quota_failed_real_input_approval_and_unknown_requests_still_block_recovery() {
+        let mut requests = vec![
+            json!({"method":"item/commandExecution/requestApproval","params":{"turnId":"older-turn","command":"private command"}}),
+            json!({"method":"item/fileChange/requestApproval","params":{"turnId":"original-turn","reason":"private reason"}}),
+            json!({"method":"item/permissions/requestApproval","params":{"turnId":"original-turn","permissions":{"private":"private permission"}}}),
+            json!({"method":"item/tool/requestUserInput","params":{"turnId":"original-turn","questions":[{"question":"private question"}]}}),
+            json!({"method":"item/tool/requestOptionPicker","params":{"options":["private option"]}}),
+            json!({"method":"mcpServer/elicitation/request","completed":false,"params":{"message":"private request"}}),
+            json!({"method":"execCommandApproval","params":{"command":"private legacy"}}),
+            json!({"method":"applyPatchApproval","params":{"patch":"private legacy"}}),
+            json!({"method":"private unknown method","params":{"tool":"private unknown tool"}}),
+            json!({"method":"item/tool/call","params":{"tool":"private unknown tool"}}),
+            json!({"method":"item/tool/call","params":{"tool":"setup_codex_step","arguments":{"step":"private invalid step"}}}),
+            json!({"method":"item/tool/call","params":{"namespace":"private unknown namespace","tool":"setup_codex_step","arguments":{"step":"complete"}}}),
+            json!({"private":"private malformed request"}),
+        ];
+        for tool in [
+            "request_environment_input",
+            "request_onboarding_input",
+            "request_option_picker",
+        ] {
+            requests.push(json!({"method":"item/tool/call","params":{"tool":tool,
+                "arguments":{"message":"private tool arguments"}}}));
+        }
+        for request in requests {
+            let mut value = quota_failed_state();
+            value["requests"] = json!([request]);
+            let metadata = project_at(&[], &value).unwrap();
+            let task = summarize(&metadata, "owner").unwrap();
+            assert!(task.waiting, "{request:?}");
+            assert!(!task.safely_quota_failed());
+            assert!(!task.matches_paused(&quota_ticket()));
+            assert!(!matches_reopened_pause(&task, &quota_ticket()));
+            assert!(!serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("private"));
+        }
+        let mut value = quota_failed_state();
+        value["requests"] = json!({"private":"private malformed array"});
+        let metadata = project_at(&[], &value).unwrap();
+        assert_eq!(
+            summarize(&metadata, "owner").unwrap().waiting_reason,
+            Some(WaitingReason::UnknownRequest)
+        );
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+    }
+
+    #[test]
+    fn request_metadata_patches_update_waiting_without_retaining_request_bodies() {
+        let mut value = quota_failed_state();
+        value["requests"] = json!([{"method":"item/plan/requestImplementation",
+            "params":{"turnId":"original-turn","planContent":"private plan"}}]);
+        let mut metadata = project_at(&[], &value).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        apply_metadata_patches(&mut metadata, &json!([
+            {"op":"replace","path":["requests",0,"method"],"value":"item/commandExecution/requestApproval"},
+            {"op":"replace","path":["requests",0,"params"],"value":{"turnId":"older-turn","command":"private command"}},
+            {"op":"add","path":["requests",0,"params","command"],"value":"private command replacement"}
+        ])).unwrap();
+        assert_eq!(metadata["requests"][0]["params"]["turnId"], "older-turn");
+        assert!(summarize(&metadata, "owner").unwrap().waiting);
+        assert_eq!(
+            summarize(&metadata, "owner").unwrap().waiting_reason,
+            Some(WaitingReason::PendingApproval)
+        );
+        assert!(!summarize(&metadata, "owner")
+            .unwrap()
+            .matches_paused(&quota_ticket()));
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+        apply_metadata_patches(&mut metadata, &json!([
+            {"op":"replace","path":["requests",0],"value":{"method":"mcpServer/elicitation/request","completed":false,"params":{"message":"private question"}}},
+            {"op":"replace","path":["requests",0,"completed"],"value":true}
+        ])).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        apply_metadata_patches(&mut metadata, &json!([
+            {"op":"replace","path":["requests",0],"value":{"method":"item/tool/call","params":{"tool":"setup_codex_step","arguments":{"step":"complete","extra":"private setup"}}}}
+        ])).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+        apply_metadata_patches(&mut metadata, &json!([
+            {"op":"replace","path":["requests",0,"params","arguments","step"],"value":"private new step"}
+        ])).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().waiting);
+        assert_eq!(
+            summarize(&metadata, "owner").unwrap().waiting_reason,
+            Some(WaitingReason::PendingUserInput)
+        );
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+        apply_metadata_patches(
+            &mut metadata,
+            &json!([
+                {"op":"remove","path":["requests",0]}
+            ]),
+        )
+        .unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+    }
+
+    #[test]
+    fn runtime_flag_enums_and_unknown_flags_block_without_leaking_text() {
+        for flag in [
+            json!("waitingOnApproval"),
+            json!("waitingOnUserInput"),
+            json!("private unknown runtime flag"),
+            json!({"private":"private malformed runtime flag"}),
+        ] {
+            let mut value = quota_failed_state();
+            value["threadRuntimeStatus"]["activeFlags"] = json!([flag]);
+            let mut metadata = project_at(&[], &value).unwrap();
+            assert!(summarize(&metadata, "owner").unwrap().waiting);
+            assert_eq!(
+                summarize(&metadata, "owner").unwrap().waiting_reason,
+                Some(match flag.as_str() {
+                    Some("waitingOnApproval") => WaitingReason::PendingApproval,
+                    Some("waitingOnUserInput") => WaitingReason::PendingUserInput,
+                    _ => WaitingReason::UnknownRuntimeFlag,
+                })
+            );
+            assert!(!serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("private"));
+            apply_metadata_patches(
+                &mut metadata,
+                &json!([
+                    {"op":"replace","path":["threadRuntimeStatus","activeFlags"],"value":[]}
+                ]),
+            )
+            .unwrap();
+            assert!(summarize(&metadata, "owner").unwrap().safely_quota_failed());
+            apply_metadata_patches(&mut metadata, &json!([
+                {"op":"add","path":["threadRuntimeStatus","activeFlags",0],"value":"waitingOnApproval"}
+            ])).unwrap();
+            assert_eq!(
+                metadata["threadRuntimeStatus"]["activeFlags"][0],
+                "waitingOnApproval"
+            );
+            assert!(summarize(&metadata, "owner").unwrap().waiting);
+            apply_metadata_patches(&mut metadata, &json!([
+                {"op":"replace","path":["threadRuntimeStatus","activeFlags",0],"value":"private changed flag"}
+            ])).unwrap();
+            assert_eq!(metadata["threadRuntimeStatus"]["activeFlags"][0], "unknown");
+            assert!(summarize(&metadata, "owner").unwrap().waiting);
+            assert!(!serde_json::to_string(&metadata)
+                .unwrap()
+                .contains("private"));
+        }
+        let mut value = quota_failed_state();
+        value["threadRuntimeStatus"]["activeFlags"] = json!("private malformed flags");
+        let metadata = project_at(&[], &value).unwrap();
+        assert!(summarize(&metadata, "owner").unwrap().waiting);
+        assert!(!serde_json::to_string(&metadata)
+            .unwrap()
+            .contains("private"));
+    }
+
+    #[test]
+    fn waiting_reason_is_safe_diagnostic_metadata_and_legacy_snapshots_still_load() {
+        let mut value = quota_failed_state();
+        value["requests"] = json!([{"method":"item/tool/requestUserInput",
+            "params":{"questions":[{"question":"private question"}]}}]);
+        let task = summarize(&project_at(&[], &value).unwrap(), "owner").unwrap();
+        let mut encoded = serde_json::to_value(&task).unwrap();
+        assert_eq!(encoded["waitingReason"], "pendingUserInput");
+        assert_eq!(task.waiting_reason.unwrap().as_str(), "pendingUserInput");
+        assert!(!serde_json::to_string(&encoded).unwrap().contains("private"));
+        encoded.as_object_mut().unwrap().remove("waitingReason");
+        let legacy: TaskSnapshot = serde_json::from_value(encoded).unwrap();
+        assert!(legacy.waiting);
+        assert_eq!(legacy.waiting_reason, None);
+        assert!(!legacy.safely_quota_failed());
+
+        let mut value = quota_failed_state();
+        value["unconfirmedTurnSubmissions"] = json!([{"text":"private future submission"}]);
+        let task = summarize(&project_at(&[], &value).unwrap(), "owner").unwrap();
+        assert_eq!(
+            task.waiting_reason,
+            Some(WaitingReason::UnconfirmedTurnSubmission)
+        );
+        assert!(!task.safely_quota_failed());
     }
 
     #[test]
@@ -2518,6 +2951,44 @@ mod tests {
         assert!(checked_length(0).is_err());
         assert!(checked_length(MAX_FRAME_BYTES + 1).is_err());
         assert!(checked_length(100).is_ok());
+        assert!(checked_length(19_272_188).is_ok());
+        assert!(checked_length(MAX_FRAME_BYTES + 1)
+            .unwrap_err()
+            .message
+            .contains("上限"));
+    }
+
+    #[tokio::test]
+    async fn large_desktop_snapshot_exceeding_old_limit_is_projected_without_retaining_body() {
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let mut session = fake_session();
+        session.io = Box::new(client);
+        session.followed.insert(THREAD.into());
+        let mut large_state = state("inProgress");
+        large_state["turns"][0]["items"] = json!([{
+            "type":"userMessage", "content":[{"type":"input_text", "text":"x".repeat(17*1024*1024)}]
+        }]);
+        let frame = json!({"type":"broadcast","sourceClientId":"owner","method":"thread-stream-state-changed","version":11,
+            "params":{"hostId":"local","conversationId":THREAD,"change":{"type":"snapshot","revision":1,"conversationState":large_state}}});
+        let bytes = serde_json::to_vec(&frame).unwrap().len();
+        assert!(bytes > 16 * 1024 * 1024 && bytes < MAX_FRAME_BYTES);
+        let write = tokio::spawn(async move {
+            write_frame(&mut server, frame).await;
+        });
+        session
+            .pump_until(tokio::time::Instant::now() + Duration::from_secs(10))
+            .await
+            .unwrap()
+            .unwrap();
+        write.await.unwrap();
+        assert!(session.current_snapshot(THREAD).unwrap().safely_running());
+        assert!(session.receive_buffer.is_empty());
+        assert!(
+            serde_json::to_vec(&session.states[THREAD].metadata)
+                .unwrap()
+                .len()
+                < 4096
+        );
     }
 
     async fn read_frame(io: &mut tokio::io::DuplexStream) -> Option<Value> {

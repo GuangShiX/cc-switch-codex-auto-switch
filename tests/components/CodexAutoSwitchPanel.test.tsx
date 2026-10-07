@@ -8,6 +8,7 @@ import { codexAutoSwitchKeys } from "@/lib/query/codexAutoSwitch";
 
 const api = vi.hoisted(() => ({
   getStatus: vi.fn(),
+  getFailureHistory: vi.fn(),
   setEnabled: vi.fn(),
   cancel: vi.fn(),
 }));
@@ -60,6 +61,7 @@ function renderPanel(copies = 1) {
 
 beforeEach(() => {
   api.getStatus.mockReset().mockResolvedValue(status());
+  api.getFailureHistory.mockReset().mockResolvedValue([]);
   api.setEnabled.mockReset().mockResolvedValue(undefined);
   api.cancel.mockReset().mockResolvedValue(undefined);
 });
@@ -129,6 +131,27 @@ describe("CodexAutoSwitchPanel", () => {
     expect(api.setEnabled).not.toHaveBeenCalled();
   });
 
+  it("shows the bounded native failure history without adding a control", async () => {
+    api.getFailureHistory.mockResolvedValue([
+      {
+        at: 1791000000000,
+        phase: "closing",
+        reason: "检测到多个 Codex 桌面窗口，未关闭桌面",
+        currentProviderId: "first",
+        targetProviderId: "second",
+      },
+    ]);
+    renderPanel();
+    await screen.findByText("最近切换失败记录");
+    expect(
+      screen.getByText("检测到多个 Codex 桌面窗口，未关闭桌面"),
+    ).toBeVisible();
+    expect(screen.getByText("本次检查账号: 当前账号 A")).toBeVisible();
+    expect(screen.getByText("目标账号: 候选账号 B")).toBeVisible();
+    expect(api.setEnabled).not.toHaveBeenCalled();
+    expect(api.cancel).not.toHaveBeenCalled();
+  });
+
   it("labels a retained cancelled snapshot as the checked account, not the current login", async () => {
     api.getStatus.mockResolvedValue(
       status({
@@ -145,6 +168,85 @@ describe("CodexAutoSwitchPanel", () => {
     expect(screen.getByText(/切号时正常关闭并重开/)).toBeVisible();
     expect(api.setEnabled).not.toHaveBeenCalled();
     expect(api.cancel).not.toHaveBeenCalled();
+  });
+
+  it("shows the saved reset wait and cancels only the native plan", async () => {
+    const reset = 1791003600000;
+    api.getStatus
+      .mockResolvedValueOnce(
+        status({
+          enabled: true,
+          phase: "waiting-for-reset",
+          waitUntil: reset,
+          canCancel: true,
+          currentProviderId: "first",
+          targetProviderId: "second",
+          message: "原任务已保存，等待实际额度恢复",
+        }),
+      )
+      .mockResolvedValue(
+        status({ enabled: true, phase: "cancelled", message: "等待已取消" }),
+      );
+    renderPanel();
+    await screen.findByText("等待 5 小时额度重置");
+    expect(screen.getByText(/最早 5 小时额度重置/)).toHaveTextContent(
+      new Date(reset).toLocaleString("zh"),
+    );
+    expect(screen.getByText(/没有可用账号时/)).toHaveTextContent(
+      "等待期间不反复重启",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "取消本次切换" }));
+    await screen.findByText("等待已取消");
+    expect(screen.queryByText(/最早 5 小时额度重置/)).not.toBeInTheDocument();
+    expect(api.cancel).toHaveBeenCalledTimes(1);
+    expect(api.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it("shows the actual failure stage, source and candidate card without changing accounts", async () => {
+    api.getFailureHistory.mockResolvedValue([
+      {
+        at: 1791000000000,
+        phase: "blocked",
+        stage: "closing",
+        source: "automatic",
+        reason: "正常退出未确认，未启用目标账号",
+        candidateFailures: ["second：5 小时剩余恰好 5%"],
+      },
+    ]);
+    renderPanel();
+    await screen.findByText("正常退出未确认，未启用目标账号");
+    expect(screen.getByText("正在关闭 Codex 桌面")).toBeVisible();
+    expect(screen.getByText("自动检测")).toBeVisible();
+    expect(screen.getByText("候选账号 B：5 小时剩余恰好 5%")).toBeVisible();
+    expect(screen.queryByText("需要处理")).not.toBeInTheDocument();
+    expect(api.cancel).not.toHaveBeenCalled();
+    expect(api.setEnabled).not.toHaveBeenCalled();
+  });
+
+  it("reports corrupt history and retries only the history read while controls remain usable", async () => {
+    api.getFailureHistory
+      .mockRejectedValueOnce(new Error("记录损坏；原记录未改动"))
+      .mockResolvedValue([
+        {
+          at: 1791000000000,
+          phase: "failed",
+          reason: "账号查询超时",
+        },
+      ]);
+    renderPanel();
+    await screen.findByText(/切换失败记录读取失败/);
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "记录损坏；原记录未改动",
+    );
+    expect(screen.getByRole("switch")).toBeEnabled();
+    await userEvent.click(
+      screen.getByRole("button", { name: "重新读取失败记录" }),
+    );
+    await screen.findByText("账号查询超时");
+    expect(screen.queryByText(/切换失败记录读取失败/)).not.toBeInTheDocument();
+    expect(api.getFailureHistory).toHaveBeenCalledTimes(2);
+    expect(api.cancel).not.toHaveBeenCalled();
+    expect(api.setEnabled).not.toHaveBeenCalled();
   });
 
   it("does not infer a successful enable from the command reply and reads status again", async () => {

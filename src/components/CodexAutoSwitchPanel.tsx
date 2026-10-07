@@ -2,12 +2,14 @@ import { useTranslation } from "react-i18next";
 import { AlertTriangle, ArrowRight, Loader2, Repeat2 } from "lucide-react";
 import type { Provider } from "@/types";
 import { useCodexAutoSwitch } from "@/lib/query/codexAutoSwitch";
+import type { CodexAutoSwitchFailure } from "@/lib/api/codexAutoSwitch";
 import { extractErrorMessage } from "@/utils/errorUtils";
 import { Switch } from "@/components/ui/switch";
 import { Button } from "@/components/ui/button";
 
 const PHASE_LABELS: Record<string, string> = {
   waiting: "等待可用账号",
+  "waiting-for-reset": "等待 5 小时额度重置",
   monitoring: "正在后台监测",
   checking: "正在查询当前账号额度",
   selecting: "正在选择 5 小时剩余额度最多的账号",
@@ -27,23 +29,49 @@ const PHASE_LABELS: Record<string, string> = {
   disabled: "自动换号已关闭",
 };
 
+const SOURCE_LABELS: Record<string, string> = {
+  manual: "手动启用",
+  automatic: "自动检测",
+  "reset-wait": "等待重置",
+};
+
 export function CodexAutoSwitchPanel({
   providers = {},
 }: {
   providers?: Record<string, Provider>;
 }) {
   const { t, i18n } = useTranslation();
-  const { status, control, isPending } = useCodexAutoSwitch();
+  const { status, failureHistory, control, isPending } = useCodexAutoSwitch();
   const data = status.data;
   const controlsDisabled = !data || status.isError || isPending;
   const needsAttention =
-    data && ["blocked", "failed", "waiting"].includes(data.phase);
+    data &&
+    ["blocked", "failed", "waiting", "waiting-for-reset"].includes(data.phase);
   const checkedAt = data?.checkedAt
     ? new Date(data.checkedAt < 1e12 ? data.checkedAt * 1000 : data.checkedAt)
     : null;
   const validCheckedAt = checkedAt && Number.isFinite(checkedAt.getTime());
   const providerName = (id: string) => providers[id]?.name || id;
+  const candidateReason = (reason: string) => {
+    const separator = reason.indexOf("：");
+    if (separator < 0) return reason;
+    const id = reason.slice(0, separator);
+    return `${providerName(id)}：${reason.slice(separator + 1)}`;
+  };
   const error = control.error || status.error;
+  const recentFailures = [...(failureHistory.data ?? [])]
+    .sort((left, right) => right.at - left.at)
+    .slice(0, 5);
+  const formatFailureTime = (failure: CodexAutoSwitchFailure) => {
+    const date = new Date(failure.at < 1e12 ? failure.at * 1000 : failure.at);
+    return Number.isFinite(date.getTime())
+      ? date.toLocaleString(i18n.language)
+      : String(failure.at);
+  };
+  const failureDateTime = (failure: CodexAutoSwitchFailure) => {
+    const date = new Date(failure.at < 1e12 ? failure.at * 1000 : failure.at);
+    return Number.isFinite(date.getTime()) ? date.toISOString() : undefined;
+  };
 
   return (
     <section
@@ -81,6 +109,12 @@ export function CodexAutoSwitchPanel({
         {t(
           "codexAutoSwitch.lifecycle",
           "切号时正常关闭并重开 Codex 桌面，再恢复本次暂停或明确因额度耗尽停止的原任务。用户手动停止、等待审批和已完成的任务不会自动继续。关闭自动开关不影响手动启用账号。",
+        )}
+      </p>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        {t(
+          "codexAutoSwitch.waitPolicy",
+          "没有可用账号时，切至周额度仍可用且 5 小时窗口最早重置的账号，保存本次原任务等待。重置后重新查询，确认额度可用才继续，等待期间不反复重启。",
         )}
       </p>
 
@@ -149,6 +183,12 @@ export function CodexAutoSwitchPanel({
           {checkedAt.toLocaleString(i18n.language)}
         </p>
       ) : null}
+      {data?.waitUntil ? (
+        <p className="text-xs text-muted-foreground">
+          {t("codexAutoSwitch.waitUntil", "最早 5 小时额度重置")}:{" "}
+          {new Date(data.waitUntil).toLocaleString(i18n.language)}
+        </p>
+      ) : null}
       {!status.isError && data?.candidateFailures?.length ? (
         <div className="space-y-1 text-xs">
           <p className="font-medium">
@@ -157,10 +197,88 @@ export function CodexAutoSwitchPanel({
           <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
             {data.candidateFailures.map((failure, index) => (
               <li key={`${index}:${failure}`} className="break-words">
-                {failure}
+                {candidateReason(failure)}
               </li>
             ))}
           </ul>
+        </div>
+      ) : null}
+      {!failureHistory.isError && recentFailures.length ? (
+        <div className="space-y-1 text-xs">
+          <p className="font-medium">
+            {t("codexAutoSwitch.failureHistory", "最近切换失败记录")}
+          </p>
+          <ol className="space-y-1 text-muted-foreground">
+            {recentFailures.map((failure, index) => (
+              <li
+                key={`${failure.at}:${failure.phase}:${index}`}
+                className="rounded-md border border-border/60 px-2 py-1.5"
+              >
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                  <time dateTime={failureDateTime(failure)}>
+                    {formatFailureTime(failure)}
+                  </time>
+                  <span aria-hidden="true">·</span>
+                  <span>
+                    {t(
+                      `codexAutoSwitch.phases.${failure.stage || failure.phase}`,
+                      {
+                        defaultValue:
+                          PHASE_LABELS[failure.stage || failure.phase] ||
+                          failure.stage ||
+                          failure.phase,
+                      },
+                    )}
+                  </span>
+                  {failure.source ? (
+                    <span>
+                      {t(`codexAutoSwitch.sources.${failure.source}`, {
+                        defaultValue:
+                          SOURCE_LABELS[failure.source] || failure.source,
+                      })}
+                    </span>
+                  ) : null}
+                  {failure.currentProviderId ? (
+                    <span>
+                      {t("codexAutoSwitch.checkedAccount", "本次检查账号")}:{" "}
+                      {providerName(failure.currentProviderId)}
+                    </span>
+                  ) : null}
+                  {failure.targetProviderId ? (
+                    <span>
+                      {t("codexAutoSwitch.target", "目标账号")}:{" "}
+                      {providerName(failure.targetProviderId)}
+                    </span>
+                  ) : null}
+                </div>
+                <p className="break-words">{failure.reason}</p>
+                {failure.candidateFailures?.length ? (
+                  <ul className="list-disc pl-4">
+                    {failure.candidateFailures.map((reason, reasonIndex) => (
+                      <li key={reasonIndex}>{candidateReason(reason)}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+      {failureHistory.isError ? (
+        <div role="alert" className="space-y-1 text-xs text-destructive">
+          <p>
+            {t("codexAutoSwitch.historyUnavailable", "切换失败记录读取失败")}:{" "}
+            {extractErrorMessage(failureHistory.error)}
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={failureHistory.isFetching}
+            onClick={() => void failureHistory.refetch()}
+          >
+            {t("codexAutoSwitch.refreshHistory", "重新读取失败记录")}
+          </Button>
         </div>
       ) : null}
       {error ? (

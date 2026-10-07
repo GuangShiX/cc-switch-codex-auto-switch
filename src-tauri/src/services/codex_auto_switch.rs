@@ -35,6 +35,10 @@ pub struct CodexAutoSwitchStatus {
     pub current_provider_id: Option<String>,
     pub target_provider_id: Option<String>,
     pub checked_at: Option<u128>,
+    /// Earliest known 5-hour reset while no replacement account is usable.
+    /// This is a hint for the background waiter, never a permission to resume
+    /// a task without a fresh quota query.
+    pub wait_until: Option<i64>,
     pub candidate_failures: Vec<String>,
     pub can_cancel: bool,
 }
@@ -49,6 +53,7 @@ impl Default for CodexAutoSwitchStatus {
             current_provider_id: None,
             target_provider_id: None,
             checked_at: None,
+            wait_until: None,
             candidate_failures: Vec::new(),
             can_cancel: false,
         }
@@ -140,24 +145,68 @@ pub fn lifecycle_status(app: &tauri::AppHandle, generation: u64, phase: &str, me
 
 fn finish(app: &tauri::AppHandle, generation: u64, phase: &str, message: String) {
     let has_uncertain_recovery = matches!(phase, "blocked" | "failed")
-        && crate::services::codex_desktop_bridge::pending_recovery_reason().is_some();
-    let status = {
+        && (crate::services::codex_desktop_bridge::pending_recovery_reason().is_some()
+            || crate::services::codex_desktop_bridge::quota_reset_wait()
+                .ok()
+                .flatten()
+                .is_some());
+    let (status, failure_context) = {
         let mut inner = lock_runtime();
         if inner.generation != generation {
             return;
         }
         inner.running = false;
         inner.started_at = None;
+        let failed_stage = inner.status.phase.clone();
+        let failed_operation = inner.status.operation_id.clone();
+        let source = if inner.manual_generation == Some(generation) {
+            "manual"
+        } else if inner.status.wait_until.is_some() {
+            "reset-wait"
+        } else {
+            "automatic"
+        };
         inner.status.phase = phase.into();
         inner.status.message = message;
         inner.status.can_cancel = has_uncertain_recovery;
+        let failure_context = if matches!(phase, "blocked" | "failed" | "waiting") {
+            Some((
+                inner.status.current_provider_id.clone(),
+                inner.status.target_provider_id.clone(),
+                failed_stage,
+                failed_operation,
+                inner.status.candidate_failures.clone(),
+                source,
+            ))
+        } else {
+            None
+        };
         inner.status.operation_id = None;
         inner.status.target_provider_id = None;
+        inner.status.wait_until = None;
         if phase == "completed" {
             inner.last_desktop_followup_failure = None;
         }
-        inner.status.clone()
+        let status = inner.status.clone();
+        (status, failure_context)
     };
+    if let Some((current_provider_id, target_provider_id, stage, operation_id, failures, source)) =
+        failure_context
+    {
+        crate::services::codex_switch_history::record_failure_with_context(
+            phase,
+            &status.message,
+            current_provider_id.as_deref(),
+            target_provider_id.as_deref(),
+            now_millis(),
+            crate::services::codex_switch_history::FailureContext {
+                operation_id: operation_id.as_deref(),
+                source: Some(source),
+                stage: Some(&stage),
+                candidate_failures: &failures,
+            },
+        );
+    }
     publish(app, &status);
 }
 
@@ -177,6 +226,7 @@ fn begin_operation(app: &tauri::AppHandle, reason: &str, preempt: bool) -> Optio
         inner.status.operation_id = Some(uuid::Uuid::new_v4().to_string());
         inner.status.current_provider_id = None;
         inner.status.target_provider_id = None;
+        inner.status.wait_until = None;
         inner.status.candidate_failures.clear();
         inner.status.can_cancel = true;
         (inner.generation, inner.status.clone())
@@ -199,6 +249,7 @@ pub fn start(app: tauri::AppHandle) {
         .get_bool_flag(ENABLED_KEY)
         .unwrap_or(false);
     let watcher_error = crate::services::codex_session_watch::ensure_started().err();
+    let saved_wait = crate::services::codex_desktop_bridge::quota_reset_wait();
     {
         let mut inner = lock_runtime();
         if inner.started {
@@ -212,19 +263,49 @@ pub fn start(app: tauri::AppHandle) {
         } else {
             "自动换号已关闭".into()
         };
+        if enabled {
+            match saved_wait {
+                Ok(Some(wait)) => {
+                    inner.status.phase = "waiting-for-reset".into();
+                    inner.status.message =
+                        "已加载额度等待记录；重置时重新核对账号、桌面和原任务后再继续".into();
+                    inner.status.wait_until = Some(wait.reset_at);
+                    inner.status.current_provider_id = Some(wait.provider_id.clone());
+                    inner.status.target_provider_id = Some(wait.provider_id);
+                    inner.status.operation_id = Some(wait.operation_id);
+                    inner.status.can_cancel = true;
+                }
+                Err(error) => {
+                    inner.status.phase = "blocked".into();
+                    inner.status.message = error;
+                }
+                Ok(None) => {}
+            }
+        }
         if let Some(error) = watcher_error {
             inner.status.phase = "blocked".into();
             inner.status.message = error;
         }
     }
     tauri::async_runtime::spawn(async move {
-        let mut interval = tokio::time::interval(CHECK_INTERVAL);
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        interval.tick().await; // leave startup and desktop state time to settle
+        let mut next_check = tokio::time::Instant::now() + CHECK_INTERVAL;
+        let mut observed_reset = None;
         loop {
             interval.tick().await;
             if !lock_runtime().status.enabled {
                 continue;
+            }
+            let reset = lock_runtime().status.wait_until;
+            let reset_due =
+                reset.is_some_and(|at| at <= now_millis() as i64 && Some(at) != observed_reset);
+            if tokio::time::Instant::now() < next_check && !reset_due {
+                continue;
+            }
+            next_check = tokio::time::Instant::now() + CHECK_INTERVAL;
+            if reset_due {
+                observed_reset = reset;
             }
             // Do not begin quota work on a locked/secure desktop. A later tick
             // makes a new decision rather than continuing this locked tick.
@@ -256,34 +337,64 @@ pub fn set_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<CodexAutoSwi
     if enabled {
         crate::services::codex_session_watch::ensure_started()?;
     }
-    app.state::<AppState>()
+    let persisted = app
+        .state::<AppState>()
         .db
         .set_setting(ENABLED_KEY, if enabled { "true" } else { "false" })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string());
+    if enabled {
+        persisted.as_ref().map_err(|error| error.clone())?;
+    }
     let status = {
         let mut inner = lock_runtime();
-        inner.status.enabled = enabled;
-        // This toggle controls the timer. It does not cancel a manual Enable
-        // whose successful activation is already being followed by a restart.
-        if inner.manual_generation.is_none() {
-            inner.generation = inner.generation.wrapping_add(1);
-            inner.running = false;
-            inner.started_at = None;
-            inner.status.phase = if enabled { "monitoring" } else { "disabled" }.into();
-            inner.status.message = if enabled {
-                "每 5 分钟后台监测已启用"
-            } else {
-                "自动换号已关闭"
-            }
-            .into();
-            inner.status.operation_id = None;
-            inner.status.target_provider_id = None;
-            inner.status.can_cancel = false;
+        apply_enabled_choice(
+            &mut inner,
+            enabled,
+            crate::services::codex_desktop_bridge::invalidate_quota_waits,
+        );
+        if let Err(error) = &persisted {
+            inner.status.message = format!(
+                "本次自动换号已关闭，旧计划已停止，但开关保存失败：{error}；下次启动前需核对开关"
+            );
         }
         inner.status.clone()
     };
     publish(app, &status);
     Ok(status)
+}
+
+fn apply_enabled_choice(
+    inner: &mut Runtime,
+    enabled: bool,
+    cancel_wait: impl FnOnce() -> Result<(), String>,
+) {
+    let changed = inner.status.enabled != enabled;
+    inner.status.enabled = enabled;
+    // Idempotent reads/reconnects and a manual Enable do not lose owned work.
+    if inner.manual_generation.is_some() || !changed {
+        return;
+    }
+    inner.generation = inner.generation.wrapping_add(1);
+    inner.running = false;
+    inner.started_at = None;
+    inner.status.phase = if enabled { "monitoring" } else { "disabled" }.into();
+    inner.status.message = if enabled {
+        "每 5 分钟后台监测已启用"
+    } else {
+        "自动换号已关闭"
+    }
+    .into();
+    inner.status.operation_id = None;
+    inner.status.target_provider_id = None;
+    inner.status.wait_until = None;
+    inner.status.can_cancel = false;
+    if !enabled {
+        if let Err(error) = cancel_wait() {
+            inner.status.message =
+                format!("自动换号已关闭，旧计划已失效；等待记录仍需核对：{error}");
+            inner.status.can_cancel = true;
+        }
+    }
 }
 
 /// Discard the old plan before any explicit user provider change. A running
@@ -304,6 +415,9 @@ pub fn invalidate_pending_without_app(reason: &str) -> CodexAutoSwitchStatus {
 }
 
 fn invalidate_locked(inner: &mut Runtime, reason: &str) {
+    if let Err(error) = crate::services::codex_desktop_bridge::invalidate_quota_waits() {
+        log::warn!("取消额度等待记录失败：{error}");
+    }
     inner.generation = inner.generation.wrapping_add(1);
     inner.running = false;
     inner.manual_generation = None;
@@ -319,6 +433,7 @@ fn invalidate_locked(inner: &mut Runtime, reason: &str) {
     inner.status.message = reason.into();
     inner.status.operation_id = None;
     inner.status.target_provider_id = None;
+    inner.status.wait_until = None;
     inner.status.can_cancel = false;
 }
 
@@ -339,6 +454,9 @@ pub fn mutate_provider_selection<T>(reason: &str, mutation: impl FnOnce() -> T) 
 /// Timer checks cannot seize the interval between enabling and restarting.
 pub fn invalidate_pending_with_generation(reason: &str) -> u64 {
     let mut inner = lock_runtime();
+    if let Err(error) = crate::services::codex_desktop_bridge::invalidate_quota_waits() {
+        log::warn!("手动启用时取消额度等待记录失败：{error}");
+    }
     inner.generation = inner.generation.wrapping_add(1);
     inner.running = false;
     inner.manual_generation = Some(inner.generation);
@@ -355,6 +473,31 @@ pub fn invalidate_pending_with_generation(reason: &str) -> u64 {
 
 pub fn operation_generation() -> u64 {
     lock_runtime().generation
+}
+
+pub fn operation_id_for_generation(generation: u64) -> Option<String> {
+    let inner = lock_runtime();
+    (inner.generation == generation)
+        .then(|| inner.status.operation_id.clone())
+        .flatten()
+}
+
+pub fn retain_owned_recovery(generation: u64) -> Result<(), String> {
+    let mut inner = lock_runtime();
+    validate_generation(&inner, generation, now_millis(), true)?;
+    if !inner.running {
+        return Err("额度等待恢复计划已停止".into());
+    }
+    inner.started_at = None;
+    Ok(())
+}
+
+pub fn set_manual_activation_context(generation: u64, current: Option<String>, target: &str) {
+    let mut inner = lock_runtime();
+    if inner.generation == generation && inner.manual_generation == Some(generation) {
+        inner.status.current_provider_id = current;
+        inner.status.target_provider_id = Some(target.into());
+    }
 }
 
 pub fn generation_is_current(generation: u64) -> Result<(), String> {
@@ -564,6 +707,44 @@ enum QuotaDecision {
     Exhausted,
 }
 
+fn five_hour_reset_at(quota: &SubscriptionQuota) -> Option<i64> {
+    let value = quota
+        .tiers
+        .iter()
+        .find(|tier| tier.name == TIER_FIVE_HOUR)
+        .and_then(|tier| tier.resets_at.as_deref())?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|date| date.timestamp_millis())
+}
+
+/// A reset is useful for waiting only when the weekly window is still usable.
+/// A weekly-exhausted account must never be selected merely because its 5-hour
+/// timer is earlier.
+fn candidate_wait_reset_at(quota: &SubscriptionQuota, now: i64) -> Option<i64> {
+    let five = window_utilization(quota, TIER_FIVE_HOUR)?;
+    let weekly = window_utilization(quota, TIER_SEVEN_DAY)?;
+    if !quota.success
+        || !matches!(
+            quota.credential_status,
+            crate::services::subscription::CredentialStatus::Valid
+        )
+        || weekly >= 100.0
+        || five < 95.0
+    {
+        return None;
+    }
+    let reset = five_hour_reset_at(quota)?;
+    reset
+        .checked_sub(now)
+        .filter(|delay| *delay > 0 && *delay <= 24 * 60 * 60 * 1_000)
+        .map(|_| reset)
+}
+
+fn candidate_wait_reset(quota: &SubscriptionQuota) -> Option<i64> {
+    candidate_wait_reset_at(quota, now_millis() as i64)
+}
+
 fn window_utilization(quota: &SubscriptionQuota, name: &str) -> Option<f64> {
     quota
         .tiers
@@ -602,6 +783,12 @@ fn quota_decision(quota: &SubscriptionQuota) -> Result<QuotaDecision, String> {
 /// The active account may keep exactly 5% remaining, but a replacement must
 /// have strictly more than 5%. Smaller usage ranks ahead of larger usage.
 fn candidate_five_hour_used(quota: &SubscriptionQuota) -> Result<Option<f64>, String> {
+    if !matches!(
+        quota.credential_status,
+        crate::services::subscription::CredentialStatus::Valid
+    ) {
+        return Err("候选账号登录授权状态未确认；未作为可用账号".into());
+    }
     if quota_decision(quota)? != QuotaDecision::Usable {
         return Ok(None);
     }
@@ -615,8 +802,10 @@ async fn query_account(
     current_provider: &str,
 ) -> Result<SubscriptionQuota, String> {
     let state = app.state::<AppState>();
-    let result = query_with_session_watch(
-        query_codex_oauth_quota_for(&state.codex_oauth_manager, account_id),
+    let manager = state.codex_oauth_manager.clone();
+    let queried_account = account_id.to_owned();
+    let result = committed_query_with_session_watch(
+        async move { query_codex_oauth_quota_for(&manager, &queried_account).await },
         || automatic_selection_is_current(app, generation, current_provider, false),
     )
     .await;
@@ -644,6 +833,25 @@ async fn query_account(
         );
     }
     result
+}
+
+/// Dropping a quota request can drop an OAuth refresh after the server rotated
+/// its token but before our existing manager persisted the reply. Cancel the
+/// switching decision promptly while allowing this already-started request to
+/// finish its native commit; its result cannot authorize the cancelled plan.
+async fn committed_query_with_session_watch<T: Send + 'static>(
+    query: impl std::future::Future<Output = Result<T, String>> + Send + 'static,
+    check: impl Fn() -> Result<(), String>,
+) -> Result<T, String> {
+    check()?;
+    let task = tokio::spawn(query);
+    // Tokio detaches on JoinHandle drop. Do not abort the task on a watcher
+    // error or timeout: account refresh mutex/CAS still protect its commit.
+    query_with_session_watch(
+        async move { task.await.map_err(|_| "托管额度查询任务失败".to_string())? },
+        check,
+    )
+    .await
 }
 
 async fn query_with_session_watch<T>(
@@ -762,9 +970,26 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
         );
         return;
     };
+    let waiting = match crate::services::codex_desktop_bridge::quota_reset_wait() {
+        Ok(waiting) => waiting,
+        Err(error) => {
+            finish(&app, generation, "blocked", error);
+            return;
+        }
+    };
     set_status(&app, generation, |status| {
         status.current_provider_id = Some(current.clone());
         status.checked_at = Some(now_millis());
+        if let Some(wait) = waiting
+            .as_ref()
+            .filter(|wait| wait.provider_id == current && wait.account_id == current_account_id)
+        {
+            // Even a failed quota request belongs to the original saved wait,
+            // allowing diagnostics to correlate retries across process restarts.
+            status.operation_id = Some(wait.operation_id.clone());
+            status.target_provider_id = Some(wait.provider_id.clone());
+            status.wait_until = Some(wait.reset_at);
+        }
     });
     if plan_is_current(&app, generation, &current).is_err() {
         return;
@@ -783,6 +1008,65 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     };
     let current_checked_at = now_millis();
     if plan_is_current(&app, generation, &current).is_err() {
+        return;
+    }
+    if let Some(wait) = waiting {
+        if wait.provider_id != current || wait.account_id != current_account_id {
+            if let Err(error) = crate::services::codex_desktop_bridge::invalidate_quota_waits() {
+                finish(&app, generation, "blocked", error);
+            } else {
+                finish(
+                    &app,
+                    generation,
+                    "cancelled",
+                    "当前账号或绑定已改变，旧额度等待计划已失效".into(),
+                );
+            }
+            return;
+        }
+        set_status(&app, generation, |status| {
+            status.operation_id = Some(wait.operation_id.clone());
+            status.target_provider_id = Some(wait.provider_id.clone());
+            status.wait_until = Some(wait.reset_at);
+        });
+        match candidate_five_hour_used(&current_quota) {
+            Ok(Some(_)) => {
+                match crate::services::codex_desktop_bridge::resume_quota_reset_wait(
+                    app.clone(),
+                    wait,
+                    generation,
+                )
+                .await
+                {
+                    Ok(message) => finish(&app, generation, "completed", message),
+                    Err(error) => finish(&app, generation, "blocked", error),
+                }
+            }
+            Ok(None) => {
+                let reset = candidate_wait_reset(&current_quota).unwrap_or(wait.reset_at);
+                if let Err(error) = crate::services::codex_desktop_bridge::update_quota_wait_time(
+                    &wait.operation_id,
+                    reset,
+                ) {
+                    finish(&app, generation, "blocked", error);
+                } else {
+                    finish_wait(
+                        &app,
+                        generation,
+                        &wait.provider_id,
+                        reset,
+                        "等待账号额度尚未恢复到可用阈值；已保存原任务，不重复重启，重置后重新查询"
+                            .into(),
+                    );
+                }
+            }
+            Err(error) => finish(
+                &app,
+                generation,
+                "blocked",
+                format!("额度等待账号查询未确认：{error}；未继续原任务"),
+            ),
+        }
         return;
     }
     match quota_decision(&current_quota) {
@@ -807,10 +1091,11 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
         status.phase = "selecting".into();
         status.message = "当前账号达到切换阈值，依次查询并选择 5 小时剩余额度最多的账号".into();
     });
-    let selection = select_most_remaining(
+    let selection = select_most_remaining_with_reset(
         providers,
         &current,
         &current_account_id,
+        Some(&current_quota),
         |account| {
             let app = app.clone();
             let current = current.clone();
@@ -819,7 +1104,7 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
         || plan_is_current(&app, generation, &current),
     )
     .await;
-    let (target, failures) = match selection {
+    let (target, failures, earliest_reset) = match selection {
         Ok(selection) => selection,
         Err(error) => {
             finish(&app, generation, "cancelled", error);
@@ -911,13 +1196,160 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
             Ok(message) => finish(&app, generation, "completed", message),
             Err(error) => finish(&app, generation, "blocked", error),
         }
-    } else {
-        finish(
-            &app,
+    } else if let Some(wait) = earliest_reset {
+        let target = wait.provider_id;
+        let target_account = providers_for_reset(&state, &target);
+        let Some(target_account) = target_account else {
+            finish(
+                &app,
+                generation,
+                "cancelled",
+                "最早重置账号的绑定已改变；等待重新检查".into(),
+            );
+            return;
+        };
+        if sample_is_stale(current_checked_at, now_millis()) {
+            match query_account(&app, &current_account_id, generation, &current).await {
+                Ok(quota) if quota_decision(&quota) == Ok(QuotaDecision::Usable) => {
+                    finish(
+                        &app,
+                        generation,
+                        "monitoring",
+                        "当前账号额度已经恢复；本次不切至耗尽账号等待".into(),
+                    );
+                    return;
+                }
+                Ok(quota) if quota_decision(&quota) == Ok(QuotaDecision::Exhausted) => {}
+                Ok(_) => {
+                    finish(
+                        &app,
+                        generation,
+                        "blocked",
+                        "当前账号额度重新核对未确认；未切号或重开".into(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    finish(
+                        &app,
+                        generation,
+                        "blocked",
+                        format!("当前账号额度重新核对失败：{error}"),
+                    );
+                    return;
+                }
+            }
+        }
+        // The first sample may have aged during sequential account queries.
+        // Revalidate the selected reset account only, never replay activation
+        // based on an expired sample or a stale user selection.
+        if sample_is_stale(wait.checked_at, now_millis()) {
+            match query_account(&app, &target_account, generation, &current).await {
+                Ok(quota) if candidate_wait_reset(&quota) == Some(wait.reset_at) => {}
+                Ok(_) => {
+                    finish(
+                        &app,
+                        generation,
+                        "waiting",
+                        "最早重置账号的额度或重置时间已改变；等待重新选择".into(),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    finish(
+                        &app,
+                        generation,
+                        "blocked",
+                        format!("等待账号重新核对失败：{error}"),
+                    );
+                    return;
+                }
+            }
+        }
+        set_status(&app, generation, |status| {
+            status.phase = "preflight".into();
+            status.target_provider_id = Some(target.clone());
+            status.wait_until = Some(wait.reset_at);
+            status.message = "无立即可用账号，正在切至最早 5 小时重置账号并保存原任务".into();
+        });
+        match crate::services::codex_desktop_bridge::switch_and_wait_for_reset(
+            app.clone(),
+            current,
+            target.clone(),
             generation,
-            "waiting",
-            "所有托管候选账号均不可用；等待后续额度恢复".into(),
-        );
+            wait.reset_at,
+        )
+        .await
+        {
+            Ok(message) => finish_wait(&app, generation, &target, wait.reset_at, message),
+            Err(error) => finish(&app, generation, "blocked", error),
+        }
+    } else {
+        finish(&app, generation, "waiting",
+            "所有托管账号均不可用；没有周额度仍可用且 5 小时重置时间明确的账号，等待后续额度恢复，未重启桌面".into());
+    }
+}
+
+fn providers_for_reset(state: &AppState, id: &str) -> Option<String> {
+    state
+        .db
+        .get_provider_by_id(id, AppType::Codex.as_str())
+        .ok()
+        .flatten()
+        .and_then(|provider| managed_account_id(&provider))
+}
+
+fn finish_wait(
+    app: &tauri::AppHandle,
+    generation: u64,
+    target: &str,
+    reset_at: i64,
+    message: String,
+) {
+    let status = {
+        let mut inner = lock_runtime();
+        if inner.generation != generation {
+            return;
+        }
+        inner.running = false;
+        inner.started_at = None;
+        inner.status.phase = "waiting-for-reset".into();
+        inner.status.current_provider_id = Some(target.into());
+        inner.status.target_provider_id = Some(target.into());
+        inner.status.wait_until = Some(reset_at);
+        inner.status.message = message;
+        inner.status.can_cancel = true;
+        inner.status.clone()
+    };
+    publish(app, &status);
+}
+
+#[derive(Debug)]
+struct ResetCandidate {
+    provider_id: String,
+    reset_at: i64,
+    checked_at: u128,
+}
+
+fn update_earliest_reset(
+    selected: &mut Option<ResetCandidate>,
+    id: &str,
+    quota: &SubscriptionQuota,
+) {
+    if let Some(reset_at) = candidate_wait_reset(quota) {
+        if selected
+            .as_ref()
+            .is_none_or(|best| reset_at < best.reset_at)
+        {
+            *selected = Some(ResetCandidate {
+                provider_id: id.into(),
+                reset_at,
+                checked_at: quota
+                    .queried_at
+                    .and_then(|time| time.try_into().ok())
+                    .unwrap_or_else(now_millis),
+            });
+        }
     }
 }
 
@@ -931,13 +1363,40 @@ struct SelectedCandidate {
 /// Query candidates in their original order and select the most 5h remaining.
 /// Equal results keep the earlier account. An unused window is the theoretical
 /// maximum, so later candidates cannot improve it and are not queried.
+#[cfg(test)]
 async fn select_most_remaining<Q, F, C>(
     providers: indexmap::IndexMap<String, Provider>,
     current: &str,
     current_account: &str,
-    mut query: Q,
+    query: Q,
     check: C,
 ) -> Result<(Option<SelectedCandidate>, Vec<String>), String>
+where
+    Q: FnMut(String) -> F,
+    F: std::future::Future<Output = Result<SubscriptionQuota, String>>,
+    C: Fn() -> Result<(), String>,
+{
+    let (selected, failures, _) =
+        select_most_remaining_with_reset(providers, current, current_account, None, query, check)
+            .await?;
+    Ok((selected, failures))
+}
+
+async fn select_most_remaining_with_reset<Q, F, C>(
+    providers: indexmap::IndexMap<String, Provider>,
+    current: &str,
+    current_account: &str,
+    current_quota: Option<&SubscriptionQuota>,
+    mut query: Q,
+    check: C,
+) -> Result<
+    (
+        Option<SelectedCandidate>,
+        Vec<String>,
+        Option<ResetCandidate>,
+    ),
+    String,
+>
 where
     Q: FnMut(String) -> F,
     F: std::future::Future<Output = Result<SubscriptionQuota, String>>,
@@ -947,8 +1406,12 @@ where
     let mut failures = Vec::new();
     let mut queried = false;
     let mut selected: Option<SelectedCandidate> = None;
+    let mut earliest_reset: Option<ResetCandidate> = None;
     for (id, provider) in providers {
         if id == current {
+            if let Some(quota) = current_quota {
+                update_earliest_reset(&mut earliest_reset, &id, quota);
+            }
             continue;
         }
         let Some(account) = managed_account_id(&provider) else {
@@ -962,9 +1425,10 @@ where
         let result = query(account).await;
         check()?;
         match result.and_then(|quota| {
+            update_earliest_reset(&mut earliest_reset, &id, &quota);
             candidate_five_hour_used(&quota).map(|used| {
                 used.map(|five_hour_used| SelectedCandidate {
-                    provider_id: id,
+                    provider_id: id.clone(),
                     five_hour_used,
                     checked_at: quota
                         .queried_at
@@ -984,22 +1448,22 @@ where
                     .as_ref()
                     .is_some_and(|best| best.five_hour_used == 0.0)
                 {
-                    return Ok((selected, failures));
+                    return Ok((selected, failures, earliest_reset));
                 }
             }
             Ok(None) => {
                 failures.push(format!(
                     "{}：候选账号需 5 小时剩余严格大于 5%，且周额度未耗尽",
-                    provider.name
+                    id
                 ));
             }
-            Err(error) => failures.push(format!("{}：{error}", provider.name)),
+            Err(error) => failures.push(format!("{id}：{error}")),
         }
     }
     if !queried {
         failures.push("账号列表中没有其他独立的托管 Codex 账号".into());
     }
-    Ok((selected, failures))
+    Ok((selected, failures, earliest_reset))
 }
 
 #[tauri::command]
@@ -1035,8 +1499,159 @@ pub fn cancel_codex_auto_switch(app: tauri::AppHandle) -> CodexAutoSwitchStatus 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apparently_successful_quota_does_not_override_invalid_candidate_login_status() {
+        for invalid in [
+            CredentialStatus::Expired,
+            CredentialStatus::NotFound,
+            CredentialStatus::ParseError,
+        ] {
+            let mut response = quota(0.0, 0.0);
+            response.credential_status = invalid;
+            assert!(candidate_five_hour_used(&response).is_err());
+        }
+    }
     use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
     use crate::services::subscription::{CredentialStatus, QuotaTier};
+
+    fn resetting_quota(used: f64, weekly: f64, at: i64) -> SubscriptionQuota {
+        let mut result = quota(used, weekly);
+        result.tiers[0].resets_at = Some(
+            chrono::DateTime::from_timestamp_millis(at)
+                .unwrap()
+                .to_rfc3339(),
+        );
+        result
+    }
+
+    #[test]
+    fn reset_wait_rejects_weekly_exhausted_unknown_expired_past_and_implausible_windows() {
+        let now = 1_800_000_000_000;
+        let valid = resetting_quota(100.0, 99.0, now + 60_000);
+        assert_eq!(candidate_wait_reset_at(&valid, now), Some(now + 60_000));
+        assert_eq!(
+            candidate_wait_reset_at(&resetting_quota(95.0, 1.0, now + 1), now),
+            Some(now + 1)
+        );
+        for mut invalid in [
+            resetting_quota(100.0, 100.0, now + 1),
+            resetting_quota(94.99, 0.0, now + 1),
+            resetting_quota(100.0, 0.0, now),
+            resetting_quota(100.0, 0.0, now - 1),
+            resetting_quota(100.0, 0.0, now + 25 * 3_600_000),
+            resetting_quota(f64::NAN, 0.0, now + 1),
+            resetting_quota(100.0, f64::NAN, now + 1),
+        ] {
+            assert_eq!(candidate_wait_reset_at(&invalid, now), None);
+            invalid.success = false;
+            assert_eq!(candidate_wait_reset_at(&invalid, now), None);
+        }
+        let mut invalid = valid.clone();
+        invalid.credential_status = CredentialStatus::Expired;
+        assert!(candidate_wait_reset_at(&invalid, now).is_none());
+        invalid = valid.clone();
+        invalid.tiers[0].resets_at = Some("not-a-time".into());
+        assert!(candidate_wait_reset_at(&invalid, now).is_none());
+        invalid = valid;
+        invalid.tiers.pop();
+        assert!(candidate_wait_reset_at(&invalid, now).is_none());
+    }
+
+    #[tokio::test]
+    async fn earliest_reset_includes_current_without_requery_and_ties_follow_list_order() {
+        let now = now_millis() as i64;
+        let rows = indexmap::IndexMap::from([
+            ("first".into(), card("first", "first-account")),
+            ("current".into(), card("current", "current-account")),
+            ("last".into(), card("last", "last-account")),
+        ]);
+        let seen = std::sync::Mutex::new(Vec::new());
+        let current = resetting_quota(100.0, 40.0, now + 60_000);
+        let (usable, _, wait) = select_most_remaining_with_reset(
+            rows.clone(),
+            "current",
+            "current-account",
+            Some(&current),
+            |account| {
+                seen.lock().unwrap().push(account.clone());
+                let reset = if account == "first-account" {
+                    now + 60_000
+                } else {
+                    now + 120_000
+                };
+                async move { Ok(resetting_quota(100.0, 40.0, reset)) }
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert!(usable.is_none());
+        assert_eq!(wait.unwrap().provider_id, "first");
+        assert_eq!(*seen.lock().unwrap(), ["first-account", "last-account"]);
+        let (_, _, wait) = select_most_remaining_with_reset(
+            rows,
+            "current",
+            "current-account",
+            Some(&current),
+            |_| async { Ok(resetting_quota(100.0, 40.0, now + 120_000)) },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(wait.unwrap().provider_id, "current");
+    }
+
+    #[tokio::test]
+    async fn usable_candidate_always_wins_over_an_earlier_exhausted_reset_account() {
+        let now = now_millis() as i64;
+        let rows = indexmap::IndexMap::from([
+            ("reset".into(), card("reset", "reset-account")),
+            ("usable".into(), card("usable", "usable-account")),
+        ]);
+        let (usable, _, wait) = select_most_remaining_with_reset(
+            rows,
+            "current",
+            "current-account",
+            None,
+            |account| async move {
+                Ok(if account == "reset-account" {
+                    resetting_quota(100.0, 0.0, now + 1_000)
+                } else {
+                    quota(10.0, 90.0)
+                })
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(usable.unwrap().provider_id, "usable");
+        assert_eq!(wait.unwrap().provider_id, "reset");
+    }
+
+    #[test]
+    fn redundant_enable_preserves_owned_wait_and_disable_wins_even_if_journal_cannot_be_read() {
+        let mut inner = Runtime::default();
+        inner.status.enabled = true;
+        inner.status.phase = "waiting-for-reset".into();
+        inner.status.operation_id = Some("owned-wait".into());
+        inner.status.wait_until = Some(123_000);
+        inner.generation = 44;
+        inner.running = true;
+        apply_enabled_choice(&mut inner, true, || {
+            panic!("Redundant enable must not cancel wait")
+        });
+        assert_eq!(inner.generation, 44);
+        assert_eq!(inner.status.operation_id.as_deref(), Some("owned-wait"));
+        apply_enabled_choice(&mut inner, false, || {
+            Err("fixture damaged wait record".into())
+        });
+        assert_eq!(inner.generation, 45);
+        assert!(!inner.running);
+        assert!(!inner.status.enabled);
+        assert!(validate_generation(&inner, 44, now_millis(), false).is_err());
+        assert!(inner.status.message.contains("fixture damaged wait record"));
+    }
 
     #[test]
     fn usable_quota_after_failed_followup_keeps_actionable_desktop_warning() {
@@ -1239,10 +1854,11 @@ mod tests {
 
     #[tokio::test]
     async fn blocked_session_before_query_sends_no_quota_request() {
-        let started = std::sync::atomic::AtomicBool::new(false);
-        let result = query_with_session_watch(
-            async {
-                started.store(true, std::sync::atomic::Ordering::SeqCst);
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_started = started.clone();
+        let result = committed_query_with_session_watch(
+            async move {
+                worker_started.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             },
             || Err("session locked".into()),
@@ -1250,6 +1866,42 @@ mod tests {
         .await;
         assert_eq!(result.unwrap_err(), "session locked");
         assert!(!started.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_selection_discards_quota_but_allows_inflight_refresh_commit() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let (release, finish) = tokio::sync::oneshot::channel::<()>();
+        let (committed, observe_commit) = tokio::sync::oneshot::channel::<()>();
+        let decision = committed_query_with_session_watch(
+            async move {
+                // Equivalent to a server accepting token rotation before the
+                // local manager receives and atomically persists its reply.
+                worker_cancelled.store(true, Ordering::SeqCst);
+                finish.await.unwrap();
+                committed.send(()).unwrap();
+                Ok("old-account-quota")
+            },
+            || {
+                if cancelled.load(Ordering::SeqCst) {
+                    Err("user changed account".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        assert_eq!(decision.unwrap_err(), "user changed account");
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), observe_commit)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

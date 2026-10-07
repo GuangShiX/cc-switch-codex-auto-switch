@@ -1,5 +1,6 @@
 pub mod balance;
 pub mod codex_auto_switch;
+pub mod codex_switch_history;
 pub mod codex_desktop_bridge;
 pub(crate) mod codex_desktop_identity;
 pub(crate) mod codex_desktop_restart;

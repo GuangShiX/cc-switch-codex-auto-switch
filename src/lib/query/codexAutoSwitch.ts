@@ -8,6 +8,7 @@ import { codexAutoSwitchApi } from "@/lib/api/codexAutoSwitch";
 
 export const codexAutoSwitchKeys = {
   status: ["codexAutoSwitch", "status"] as const,
+  failureHistory: ["codexAutoSwitch", "failureHistory"] as const,
   control: ["codexAutoSwitch", "control"] as const,
 };
 
@@ -18,6 +19,15 @@ export function useCodexAutoSwitch() {
     queryFn: codexAutoSwitchApi.getStatus,
     // Display refresh only. The native service monitors independently of this query.
     refetchInterval: 2000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
+  const failureHistory = useQuery({
+    queryKey: codexAutoSwitchKeys.failureHistory,
+    queryFn: codexAutoSwitchApi.getFailureHistory,
+    // The native service owns recording; this only keeps the visible audit
+    // list fresh when the panel is open.
+    refetchInterval: 5000,
     refetchOnWindowFocus: true,
     retry: false,
   });
@@ -40,6 +50,7 @@ export function useCodexAutoSwitch() {
 
   return {
     status,
+    failureHistory,
     control,
     isPending: pendingControls > 0,
   };

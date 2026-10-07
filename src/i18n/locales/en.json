@@ -9,12 +9,23 @@
     "checkedAccount": "Account checked",
     "target": "Target account",
     "lastChecked": "Last quota check",
+    "waitUntil": "Earliest 5-hour reset",
     "candidateFailures": "Reasons accounts are unavailable",
+    "failureHistory": "Recent switch failures",
+    "historyUnavailable": "Unable to read switch failure history",
+    "refreshHistory": "Read failure history again",
+    "waitPolicy": "If no account is available, select the earliest 5-hour reset with weekly quota remaining and save this operation's tasks. Query again after reset and continue only when quota is available, without repeated restarts while waiting.",
+    "sources": {
+      "manual": "Manual Enable",
+      "automatic": "Automatic check",
+      "reset-wait": "Reset wait"
+    },
     "statusUnavailable": "Unable to read background status",
     "loading": "Reading background status",
     "refreshStatus": "Read status again",
     "phases": {
       "waiting": "Waiting for an available account",
+      "waiting-for-reset": "Waiting for the 5-hour quota reset",
       "monitoring": "Monitoring in the background",
       "checking": "Checking current account quota",
       "selecting": "Selecting the account with the most 5-hour quota remaining",
