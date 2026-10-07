@@ -15,6 +15,8 @@ import {
   setCurrentProviderId,
   setLiveProviderIds,
   setProviders,
+  getSettings,
+  setSettings,
 } from "../msw/state";
 import { emitTauriEvent } from "../msw/tauriMocks";
 import { server } from "../msw/server";
@@ -209,6 +211,46 @@ const renderApp = (AppComponent: ComponentType, client = new QueryClient()) => {
   );
 };
 
+function mockNativeAutoSwitch() {
+  setSettings({ ...getSettings(), firstRunNoticeConfirmed: true });
+  const setEnabled = vi.fn();
+  const cancel = vi.fn();
+  server.use(
+    http.post("http://tauri.local/get_codex_auto_switch_status", () =>
+      HttpResponse.json({
+        enabled: true,
+        phase: "blocked",
+        message: "测试后台状态保持不变",
+        currentProviderId: "codex-1",
+        targetProviderId: "codex-2",
+        candidateFailures: [],
+        canCancel: true,
+      }),
+    ),
+    http.post("http://tauri.local/get_codex_auto_switch_failure_history", () =>
+      HttpResponse.json([
+        {
+          at: 1791000000000,
+          phase: "closing",
+          reason: "测试失败记录：正常退出超时",
+        },
+      ]),
+    ),
+    http.post(
+      "http://tauri.local/set_codex_auto_switch_enabled",
+      ({ request }) => {
+        setEnabled(request);
+        return HttpResponse.json(null);
+      },
+    ),
+    http.post("http://tauri.local/cancel_codex_auto_switch", () => {
+      cancel();
+      return HttpResponse.json(null);
+    }),
+  );
+  return { setEnabled, cancel };
+}
+
 describe("App integration with MSW", () => {
   beforeEach(() => {
     resetProviderState();
@@ -219,6 +261,110 @@ describe("App integration with MSW", () => {
     skillsPanelMocks.openDiscovery.mockReset();
     localStorage.removeItem("cc-switch-last-view");
     localStorage.removeItem("cc-switch-last-app");
+  });
+
+  it("opens auto switch from the Codex toolbar and returns without changing native controls", async () => {
+    localStorage.setItem("cc-switch-last-app", "codex");
+    const native = mockNativeAutoSwitch();
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("provider-list")).toHaveTextContent("codex-1"),
+    );
+    expect(
+      screen.queryByRole("region", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("switch", { name: "自动换号开关" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Codex 桌面自动换号" }));
+    expect(
+      await screen.findByRole("region", { name: "Codex 桌面自动换号" }),
+    ).toBeInTheDocument();
+    await screen.findByText("测试后台状态保持不变");
+    expect(screen.queryByTestId("provider-list")).not.toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "自动换号开关" })).toBeChecked();
+    expect(
+      screen.getByRole("button", { name: "取消本次切换" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("本次检查账号: Codex Default")).toBeInTheDocument();
+    expect(screen.getByText("目标账号: Codex Secondary")).toBeInTheDocument();
+    await screen.findByText("测试失败记录：正常退出超时");
+    expect(localStorage.getItem("cc-switch-last-view")).toBe("codexAutoSwitch");
+
+    fireEvent.click(screen.getByRole("button", { name: "common.back" }));
+    await screen.findByTestId("provider-list");
+    expect(
+      screen.queryByRole("region", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByTestId("current-provider")).toHaveTextContent("codex-1");
+    expect(localStorage.getItem("cc-switch-last-view")).toBe("providers");
+    fireEvent.click(screen.getByRole("button", { name: "Codex 桌面自动换号" }));
+    await screen.findByRole("region", { name: "Codex 桌面自动换号" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await screen.findByTestId("provider-list");
+    expect(
+      screen.queryByRole("region", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(native.setEnabled).not.toHaveBeenCalled();
+    expect(native.cancel).not.toHaveBeenCalled();
+  }, 10_000);
+
+  it("restores the persisted auto switch page for Codex", async () => {
+    localStorage.setItem("cc-switch-last-app", "codex");
+    localStorage.setItem("cc-switch-last-view", "codexAutoSwitch");
+    const native = mockNativeAutoSwitch();
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    await screen.findByText("测试后台状态保持不变");
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Codex 桌面自动换号" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "自动换号开关" })).toBeChecked();
+    expect(screen.queryByTestId("provider-list")).not.toBeInTheDocument();
+    expect(localStorage.getItem("cc-switch-last-view")).toBe("codexAutoSwitch");
+    expect(native.setEnabled).not.toHaveBeenCalled();
+    expect(native.cancel).not.toHaveBeenCalled();
+  });
+
+  it("keeps the auto switch page and toolbar entry limited to Codex", async () => {
+    localStorage.setItem("cc-switch-last-app", "claude");
+    localStorage.setItem("cc-switch-last-view", "codexAutoSwitch");
+    const native = mockNativeAutoSwitch();
+    const { default: App } = await import("@/App");
+    renderApp(App);
+
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "claude-1",
+      ),
+    );
+    expect(
+      screen.queryByRole("region", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(localStorage.getItem("cc-switch-last-view")).toBe("providers");
+
+    fireEvent.click(screen.getByText("switch-codex"));
+    expect(
+      await screen.findByRole("button", { name: "Codex 桌面自动换号" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByText("switch-claude"));
+    await waitFor(() =>
+      expect(screen.getByTestId("current-provider")).toHaveTextContent(
+        "claude-1",
+      ),
+    );
+    expect(
+      screen.queryByRole("button", { name: "Codex 桌面自动换号" }),
+    ).not.toBeInTheDocument();
+    expect(native.setEnabled).not.toHaveBeenCalled();
+    expect(native.cancel).not.toHaveBeenCalled();
   });
 
   it("reflects native activation before the desktop lifecycle returns", async () => {

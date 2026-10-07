@@ -27,6 +27,7 @@ import {
   LayoutDashboard,
   Loader2,
   RefreshCw,
+  Repeat2,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -120,6 +121,7 @@ type View =
   | "prompts"
   | "skills"
   | "skillsDiscovery"
+  | "codexAutoSwitch"
   | "mcp"
   | "agents"
   | "universal"
@@ -155,6 +157,7 @@ const VALID_VIEWS: View[] = [
   "prompts",
   "skills",
   "skillsDiscovery",
+  "codexAutoSwitch",
   "mcp",
   "agents",
   "universal",
@@ -225,8 +228,12 @@ function App() {
     }
   }, [visibleApps, activeApp]);
 
-  // Fallback from sessions view when switching to an app without session support
+  // Return to providers when a saved page does not support the selected app.
   useEffect(() => {
+    if (currentView === "codexAutoSwitch" && activeApp !== "codex") {
+      setCurrentView("providers");
+      return;
+    }
     if (currentView === "mcp" && sharedFeatureApp === "pi") {
       setCurrentView("providers");
       return;
@@ -245,7 +252,7 @@ function App() {
     ) {
       setCurrentView("providers");
     }
-  }, [sharedFeatureApp, currentView]);
+  }, [activeApp, sharedFeatureApp, currentView]);
 
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
   const [usageProvider, setUsageProvider] = useState<Provider | null>(null);
@@ -1059,6 +1066,12 @@ function App() {
           );
         case "hermesMemory":
           return <HermesMemoryPanel />;
+        case "codexAutoSwitch":
+          return activeApp === "codex" ? (
+            <div className="w-full max-w-5xl mx-auto px-6 pt-4 pb-12">
+              <CodexAutoSwitchPanel providers={providers} />
+            </div>
+          ) : null;
         case "skills":
           return (
             <UnifiedSkillsPanel
@@ -1132,9 +1145,6 @@ function App() {
                     transition={{ duration: 0.15 }}
                     className="space-y-4"
                   >
-                    {activeApp === "codex" && (
-                      <CodexAutoSwitchPanel providers={providers} />
-                    )}
                     <ProviderList
                       providers={providers}
                       currentProviderId={currentProviderId}
@@ -1342,6 +1352,8 @@ function App() {
                     })}
                   {currentView === "skills" && t("skills.title")}
                   {currentView === "skillsDiscovery" && t("skills.title")}
+                  {currentView === "codexAutoSwitch" &&
+                    t("codexAutoSwitch.title", "Codex 桌面自动换号")}
                   {currentView === "mcp" && t("mcp.unifiedPanel.title")}
                   {currentView === "agents" && t("agents.title")}
                   {currentView === "universal" &&
@@ -1724,6 +1736,26 @@ function App() {
                               >
                                 <Wrench className="flex-shrink-0 w-4 h-4" />
                               </Button>
+                              {activeApp === "codex" && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  onClick={() =>
+                                    setCurrentView("codexAutoSwitch")
+                                  }
+                                  className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                                  aria-label={t(
+                                    "codexAutoSwitch.title",
+                                    "Codex 桌面自动换号",
+                                  )}
+                                  title={t(
+                                    "codexAutoSwitch.title",
+                                    "Codex 桌面自动换号",
+                                  )}
+                                >
+                                  <Repeat2 className="w-4 h-4" />
+                                </Button>
+                              )}
                               <Button
                                 variant="ghost"
                                 size="sm"
