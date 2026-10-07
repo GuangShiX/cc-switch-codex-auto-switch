@@ -17,6 +17,35 @@ vi.mock("@/components/SubscriptionQuotaFooter", () => ({
 }));
 
 describe("Codex OAuth quota card", () => {
+  it("labels explicitly weekly-only Pro without inventing a five-hour quota", () => {
+    const quota = {
+      success: true,
+      codexLimitPolicy: "weekly_only",
+      tiers: [{ name: "seven_day", utilization: 18, resetsAt: null }],
+    };
+    quotaHook.mockReturnValue({
+      data: quota,
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+
+    render(<CodexOauthQuotaFooter isCurrent />);
+
+    expect(screen.getByText("Pro · 无5小时窗口")).toBeInTheDocument();
+    expect(viewProps).toHaveBeenCalledWith(expect.objectContaining({ quota }));
+    expect(quota.tiers).toHaveLength(1);
+  });
+
+  it("does not infer the Pro label from a missing five-hour tier", () => {
+    quotaHook.mockReturnValue({
+      data: { success: true, tiers: [{ name: "seven_day", utilization: 18 }] },
+      isFetching: false,
+      refetch: vi.fn(),
+    });
+    render(<CodexOauthQuotaFooter isCurrent />);
+    expect(screen.queryByText("Pro · 无5小时窗口")).not.toBeInTheDocument();
+  });
+
   it("loads inactive managed cards initially without enabling their polling", () => {
     quotaHook.mockReturnValue({
       data: undefined,

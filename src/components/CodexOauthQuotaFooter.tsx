@@ -32,7 +32,8 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
     refetch,
   } = useCodexOauthQuota(meta, {
     // Every account loads its initial quota; only the current account polls.
-    // Shared account query keys reuse fresh cached/native results on remount.
+    // Inactive accounts reuse cached/native results for thirty minutes,
+    // including when cards are remounted during navigation.
     enabled: true,
     autoQuery: isCurrent && autoQueryInterval > 0,
     autoQueryIntervalMinutes: autoQueryInterval,
@@ -54,6 +55,11 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
 
   return (
     <div className={inline ? "inline-flex items-center gap-1" : undefined}>
+      {quota?.success && quota.codexLimitPolicy === "weekly_only" ? (
+        <span className="text-xs text-muted-foreground">
+          {t("codexAutoSwitch.weeklyOnlyPro", "Pro · 无5小时窗口")}
+        </span>
+      ) : null}
       {quota?.success ? (
         <span className="text-xs text-muted-foreground">
           {t("codexAutoSwitch.quotaUsed", "已用")}

@@ -1541,6 +1541,7 @@ mod tests {
             extra_usage: None,
             error: None,
             queried_at: Some(0),
+            codex_limit_policy: None,
         }
     }
 

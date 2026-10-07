@@ -15,7 +15,8 @@ interface CodexOauthAccountQuotaProps {
  * `SubscriptionQuotaView` 的展开布局（进度条 + 重置倒计时 + 刷新按钮），
  * 因此与供应商卡片里的额度展示保持完全一致的观感与状态处理。
  *
- * 面板打开时拉取一次，不轮询；用户可点卡片内的刷新按钮手动更新。
+ * 面板打开时缺少缓存或缓存超过 30 分钟才查询，不轮询；与供应商卡片
+ * 共用账号缓存，用户可点卡片内的刷新按钮立即手动更新。
  */
 const CodexOauthAccountQuota: React.FC<CodexOauthAccountQuotaProps> = ({
   accountId,

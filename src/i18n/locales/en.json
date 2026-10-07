@@ -3,6 +3,7 @@
     "title": "Codex desktop account switching",
     "enable": "Automatic account switching",
     "quotaUsed": "Used",
+    "weeklyOnlyPro": "Pro · No 5h window",
     "thresholds": "Switch when the current account has strictly less than 5% of its 5-hour quota remaining, or no weekly quota. Candidates must have more than 5% of their 5-hour quota and more than 0% weekly remaining. Prefer the most remaining 5-hour quota; ties follow list order.",
     "background": "CC Switch checks quota in the background every 5 minutes, including while minimized or hidden in the tray. A locked desktop skips the switch; quota and account state are checked again after unlock.",
     "cancel": "Cancel this switch",

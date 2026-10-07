@@ -30,4 +30,6 @@ export interface SubscriptionQuota {
   extraUsage: ExtraUsage | null;
   error: string | null;
   queriedAt: number | null;
+  /** Explicit Pro response with a weekly window and no five-hour limit. */
+  codexLimitPolicy?: "weekly_only" | null;
 }

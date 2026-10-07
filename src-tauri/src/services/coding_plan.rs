@@ -108,6 +108,7 @@ fn make_error(msg: String) -> SubscriptionQuota {
         extra_usage: None,
         error: Some(msg),
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     }
 }
 
@@ -140,6 +141,7 @@ async fn query_kimi(api_key: &str) -> Result<SubscriptionQuota, String> {
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
 
@@ -216,6 +218,7 @@ async fn query_kimi(api_key: &str) -> Result<SubscriptionQuota, String> {
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 
@@ -361,6 +364,7 @@ async fn query_zhipu(base_url: &str, api_key: &str) -> Result<SubscriptionQuota,
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
 
@@ -418,6 +422,7 @@ fn zhipu_quota_from_body(body: &serde_json::Value) -> SubscriptionQuota {
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     }
 }
 
@@ -459,6 +464,7 @@ async fn query_minimax(api_key: &str, is_cn: bool) -> Result<SubscriptionQuota, 
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
 
@@ -505,6 +511,7 @@ async fn query_minimax(api_key: &str, is_cn: bool) -> Result<SubscriptionQuota, 
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 
@@ -537,6 +544,7 @@ async fn query_zenmux(base_url: &str, api_key: &str) -> Result<SubscriptionQuota
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
 
@@ -643,6 +651,7 @@ async fn query_zenmux(base_url: &str, api_key: &str) -> Result<SubscriptionQuota
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 
@@ -797,6 +806,7 @@ async fn query_opencode_go(api_key: &str) -> Result<SubscriptionQuota, String> {
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
     if !status.is_success() {
@@ -829,6 +839,7 @@ async fn query_opencode_go(api_key: &str) -> Result<SubscriptionQuota, String> {
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 
@@ -1216,6 +1227,7 @@ fn volcengine_success(tiers: Vec<QuotaTier>, plan: Option<String>) -> Subscripti
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     }
 }
 
@@ -1229,6 +1241,7 @@ fn volcengine_auth_error(detail: String) -> SubscriptionQuota {
         extra_usage: None,
         error: Some(detail),
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     }
 }
 
@@ -1320,6 +1333,7 @@ fn coding_plan_not_found(error: &str) -> SubscriptionQuota {
         extra_usage: None,
         error: Some(error.to_string()),
         queried_at: None,
+        codex_limit_policy: None,
     }
 }
 
@@ -1378,6 +1392,7 @@ async fn query_zhipu_team_at(
             extra_usage: None,
             error: Some(format!("Authentication failed (HTTP {status})")),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         });
     }
 

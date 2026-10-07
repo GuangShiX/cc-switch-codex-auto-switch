@@ -10,6 +10,8 @@ import { resolveDisplayUsage, type LastGoodSnapshot } from "./queries";
 import { extractErrorMessage } from "@/utils/errorUtils";
 
 const REFETCH_INTERVAL = 5 * 60 * 1000; // 5 minutes
+const INACTIVE_CODEX_QUOTA_STALE_TIME = 30 * 60 * 1000;
+const INACTIVE_CODEX_QUOTA_CACHE_TIME = 60 * 60 * 1000;
 
 export const subscriptionKeys = {
   all: ["subscription"] as const,
@@ -133,6 +135,14 @@ export function useCodexOauthQuotaByAccountId(
     autoQuery && autoQueryIntervalMinutes > 0
       ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
       : false;
+  // Inactive cards and the auth center share a longer cache. Opening either
+  // view still loads missing quotas, while navigation does not requery every
+  // account after the active account's five-minute monitoring interval.
+  const staleTime = autoQuery
+    ? autoQueryIntervalMinutes > 0
+      ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
+      : REFETCH_INTERVAL
+    : INACTIVE_CODEX_QUOTA_STALE_TIME;
   const query = useQuery({
     queryKey: ["codex_oauth", "quota", accountId ?? "default"],
     queryFn: () => subscriptionApi.getCodexOauthQuota(accountId),
@@ -140,10 +150,8 @@ export function useCodexOauthQuotaByAccountId(
     refetchInterval,
     refetchIntervalInBackground: Boolean(refetchInterval),
     refetchOnWindowFocus: Boolean(refetchInterval),
-    staleTime:
-      autoQueryIntervalMinutes > 0
-        ? Math.max(autoQueryIntervalMinutes, 1) * 60 * 1000
-        : REFETCH_INTERVAL,
+    staleTime,
+    gcTime: autoQuery ? undefined : INACTIVE_CODEX_QUOTA_CACHE_TIME,
     retry: 1,
   });
 

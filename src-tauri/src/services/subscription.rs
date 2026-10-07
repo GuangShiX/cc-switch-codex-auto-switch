@@ -51,6 +51,14 @@ pub struct ExtraUsage {
     pub currency: Option<String>,
 }
 
+/// API 已确认的 Codex 限额配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexLimitPolicy {
+    /// API 明确返回 Pro 的单个周窗口，未配置 5 小时窗口。
+    WeeklyOnly,
+}
+
 /// 订阅额度查询结果
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +71,8 @@ pub struct SubscriptionQuota {
     pub extra_usage: Option<ExtraUsage>,
     pub error: Option<String>,
     pub queried_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_limit_policy: Option<CodexLimitPolicy>,
 }
 
 impl SubscriptionQuota {
@@ -76,6 +86,7 @@ impl SubscriptionQuota {
             extra_usage: None,
             error: None,
             queried_at: None,
+            codex_limit_policy: None,
         }
     }
 
@@ -89,6 +100,7 @@ impl SubscriptionQuota {
             extra_usage: None,
             error: Some(message),
             queried_at: Some(now_millis()),
+            codex_limit_policy: None,
         }
     }
 }
@@ -524,6 +536,7 @@ fn parse_claude_quota(body: &serde_json::Value) -> SubscriptionQuota {
         extra_usage,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     }
 }
 
@@ -712,7 +725,65 @@ struct CodexRateLimit {
 
 #[derive(Deserialize)]
 struct CodexUsageResponse {
+    plan_type: Option<String>,
     rate_limit: Option<CodexRateLimit>,
+}
+
+fn codex_limit_policy(body: &CodexUsageResponse) -> Option<CodexLimitPolicy> {
+    // 缺失窗口不代表没有限制。只有 API 明确给出的 Pro 单周窗口才允许此标记。
+    if body.plan_type.as_deref() != Some("pro") {
+        return None;
+    }
+    let rate_limit = body.rate_limit.as_ref()?;
+    if rate_limit.secondary_window.is_some() {
+        return None;
+    }
+    let weekly = rate_limit.primary_window.as_ref()?;
+    if weekly.limit_window_seconds != Some(604800)
+        || !weekly
+            .used_percent
+            .is_some_and(|used| used.is_finite() && (0.0..=100.0).contains(&used))
+    {
+        return None;
+    }
+    Some(CodexLimitPolicy::WeeklyOnly)
+}
+
+fn parse_codex_usage_response(body: CodexUsageResponse, tool_label: &str) -> SubscriptionQuota {
+    let codex_limit_policy = codex_limit_policy(&body);
+    let mut tiers = Vec::new();
+
+    if let Some(rate_limit) = body.rate_limit {
+        for window in [rate_limit.primary_window, rate_limit.secondary_window]
+            .into_iter()
+            .flatten()
+        {
+            if let Some(used) = window.used_percent {
+                tiers.push(QuotaTier {
+                    name: window
+                        .limit_window_seconds
+                        .map(window_seconds_to_tier_name)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    utilization: used,
+                    resets_at: window.reset_at.and_then(unix_ts_to_iso),
+                    used_value_usd: None,
+                    max_value_usd: None,
+                });
+            }
+        }
+    }
+
+    SubscriptionQuota {
+        tool: tool_label.to_string(),
+        credential_status: CredentialStatus::Valid,
+        credential_message: None,
+        success: true,
+        tiers,
+        extra_usage: None,
+        error: None,
+        queried_at: Some(now_millis()),
+        codex_limit_policy,
+    }
 }
 
 /// 根据窗口秒数映射到 tier 名称（与 Claude 的命名兼容以复用前端 i18n）
@@ -802,38 +873,7 @@ pub(crate) async fn query_codex_quota(
         }
     };
 
-    let mut tiers = Vec::new();
-
-    if let Some(rate_limit) = body.rate_limit {
-        for window in [rate_limit.primary_window, rate_limit.secondary_window]
-            .into_iter()
-            .flatten()
-        {
-            if let Some(used) = window.used_percent {
-                tiers.push(QuotaTier {
-                    name: window
-                        .limit_window_seconds
-                        .map(window_seconds_to_tier_name)
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    utilization: used,
-                    resets_at: window.reset_at.and_then(unix_ts_to_iso),
-                    used_value_usd: None,
-                    max_value_usd: None,
-                });
-            }
-        }
-    }
-
-    Ok(SubscriptionQuota {
-        tool: tool_label.to_string(),
-        credential_status: CredentialStatus::Valid,
-        credential_message: None,
-        success: true,
-        tiers,
-        extra_usage: None,
-        error: None,
-        queried_at: Some(now_millis()),
-    })
+    Ok(parse_codex_usage_response(body, tool_label))
 }
 
 // ── Gemini 凭据读取 ──────────────────────────────────────
@@ -1299,6 +1339,7 @@ async fn query_gemini_quota(access_token: &str) -> Result<SubscriptionQuota, Str
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 
@@ -1436,6 +1477,147 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codex_quota(body: serde_json::Value) -> SubscriptionQuota {
+        parse_codex_usage_response(serde_json::from_value(body).unwrap(), "codex_oauth")
+    }
+
+    fn codex_pro_weekly_response() -> serde_json::Value {
+        serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 18.0,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1802292000
+                },
+                "secondary_window": null
+            }
+        })
+    }
+
+    #[test]
+    fn codex_pro_single_weekly_window_is_explicit_without_inventing_five_hour_usage() {
+        let quota = codex_quota(codex_pro_weekly_response());
+        assert!(quota.success);
+        assert_eq!(quota.codex_limit_policy, Some(CodexLimitPolicy::WeeklyOnly));
+        assert_eq!(quota.tiers.len(), 1);
+        assert_eq!(quota.tiers[0].name, TIER_SEVEN_DAY);
+        assert_eq!(quota.tiers[0].utilization, 18.0);
+        assert!(quota.tiers[0].resets_at.is_some());
+        let serialized = serde_json::to_value(&quota).unwrap();
+        assert_eq!(serialized["codexLimitPolicy"], "weekly_only");
+        assert_eq!(serialized["tiers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn codex_pro_weekly_only_accepts_an_absent_secondary_window() {
+        let mut body = codex_pro_weekly_response();
+        body["rate_limit"]
+            .as_object_mut()
+            .unwrap()
+            .remove("secondary_window");
+        assert_eq!(
+            codex_quota(body).codex_limit_policy,
+            Some(CodexLimitPolicy::WeeklyOnly)
+        );
+    }
+
+    #[test]
+    fn codex_weekly_only_requires_the_explicit_pro_plan() {
+        for plan in [
+            serde_json::Value::Null,
+            serde_json::json!("plus"),
+            serde_json::json!("free"),
+            serde_json::json!("unknown"),
+        ] {
+            let mut body = codex_pro_weekly_response();
+            body["plan_type"] = plan;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+        let mut body = codex_pro_weekly_response();
+        body.as_object_mut().unwrap().remove("plan_type");
+        assert_eq!(codex_quota(body).codex_limit_policy, None);
+    }
+
+    #[test]
+    fn codex_weekly_only_rejects_missing_or_invalid_primary_usage() {
+        for used in [
+            serde_json::Value::Null,
+            serde_json::json!(-1.0),
+            serde_json::json!(100.1),
+        ] {
+            let mut body = codex_pro_weekly_response();
+            body["rate_limit"]["primary_window"]["used_percent"] = used;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+        for primary in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut body = codex_pro_weekly_response();
+            body["rate_limit"]["primary_window"] = primary;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+        for rate_limit in [serde_json::Value::Null, serde_json::json!({})] {
+            let mut body = codex_pro_weekly_response();
+            body["rate_limit"] = rate_limit;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+        for seconds in [
+            serde_json::Value::Null,
+            serde_json::json!(18000),
+            serde_json::json!(604799),
+        ] {
+            let mut body = codex_pro_weekly_response();
+            body["rate_limit"]["primary_window"]["limit_window_seconds"] = seconds;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+    }
+
+    #[test]
+    fn codex_pro_with_secondary_windows_keeps_normal_two_window_policy() {
+        for secondary in [
+            serde_json::json!({}),
+            serde_json::json!({ "used_percent": 0.0, "limit_window_seconds": 18000 }),
+            serde_json::json!({ "used_percent": 18.0, "limit_window_seconds": 604800 }),
+        ] {
+            let mut body = codex_pro_weekly_response();
+            body["rate_limit"]["secondary_window"] = secondary;
+            assert_eq!(codex_quota(body).codex_limit_policy, None);
+        }
+        let quota = codex_quota(serde_json::json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": { "used_percent": 50.0, "limit_window_seconds": 18000 },
+                "secondary_window": { "used_percent": 18.0, "limit_window_seconds": 604800 }
+            }
+        }));
+        assert_eq!(quota.codex_limit_policy, None);
+        assert_eq!(quota.tiers.len(), 2);
+        assert_eq!(quota.tiers[0].name, TIER_FIVE_HOUR);
+        assert_eq!(quota.tiers[0].utilization, 50.0);
+    }
+
+    #[test]
+    fn codex_weekly_policy_marks_exhaustion_without_replacing_the_real_percentage() {
+        let mut body = codex_pro_weekly_response();
+        body["rate_limit"]["primary_window"]["used_percent"] = serde_json::json!(100.0);
+        let quota = codex_quota(body);
+        assert_eq!(quota.codex_limit_policy, Some(CodexLimitPolicy::WeeklyOnly));
+        assert_eq!(quota.tiers[0].utilization, 100.0);
+    }
+
+    #[test]
+    fn subscription_quota_without_new_policy_field_keeps_cache_compatibility() {
+        let quota: SubscriptionQuota = serde_json::from_value(serde_json::json!({
+            "tool": "codex_oauth", "credentialStatus": "valid", "credentialMessage": null,
+            "success": true, "tiers": [], "extraUsage": null, "error": null, "queriedAt": 0
+        }))
+        .unwrap();
+        assert_eq!(quota.codex_limit_policy, None);
+        assert!(serde_json::to_value(&quota)
+            .unwrap()
+            .get("codexLimitPolicy")
+            .is_none());
+    }
 
     fn scoped_limit(model: &str, percent: f64) -> serde_json::Value {
         serde_json::json!({

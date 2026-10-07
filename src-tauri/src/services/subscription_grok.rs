@@ -675,6 +675,7 @@ pub(crate) async fn query_grok_quota(
         extra_usage: None,
         error: None,
         queried_at: Some(now_millis()),
+        codex_limit_policy: None,
     })
 }
 

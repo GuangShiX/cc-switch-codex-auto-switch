@@ -15,7 +15,9 @@ use tauri::{Emitter, Manager};
 use crate::app_config::AppType;
 use crate::commands::{publish_codex_oauth_quota, query_codex_oauth_quota_for};
 use crate::provider::Provider;
-use crate::services::subscription::{SubscriptionQuota, TIER_FIVE_HOUR, TIER_SEVEN_DAY};
+use crate::services::subscription::{
+    CodexLimitPolicy, SubscriptionQuota, TIER_FIVE_HOUR, TIER_SEVEN_DAY,
+};
 use crate::services::ProviderService;
 use crate::store::AppState;
 
@@ -755,7 +757,14 @@ fn window_utilization(quota: &SubscriptionQuota, name: &str) -> Option<f64> {
         .filter(|used| used.is_finite() && *used >= 0.0)
 }
 
-/// Missing or invalid windows are unknown, never implicitly available.
+fn has_weekly_only_policy(quota: &SubscriptionQuota) -> bool {
+    quota.codex_limit_policy == Some(CodexLimitPolicy::WeeklyOnly)
+        && matches!(quota.tool.as_str(), "codex" | "codex_oauth")
+        && !quota.tiers.is_empty()
+        && quota.tiers.iter().all(|tier| tier.name == TIER_SEVEN_DAY)
+}
+
+/// Missing windows stay unknown unless the API explicitly confirmed weekly-only Pro.
 fn quota_decision(quota: &SubscriptionQuota) -> Result<QuotaDecision, String> {
     if !quota.success {
         return Err(quota
@@ -764,25 +773,53 @@ fn quota_decision(quota: &SubscriptionQuota) -> Result<QuotaDecision, String> {
             .or_else(|| quota.credential_message.clone())
             .unwrap_or_else(|| "额度查询未成功".into()));
     }
+    if !matches!(
+        quota.credential_status,
+        crate::services::subscription::CredentialStatus::Valid
+    ) {
+        return Err("账号登录授权状态未确认".into());
+    }
     let five_hour_used = window_utilization(quota, TIER_FIVE_HOUR);
     let weekly_used = window_utilization(quota, TIER_SEVEN_DAY);
-    // Either exhausted window proves a switch is needed even if the other is
-    // absent. Conversely, a candidate is usable only when both windows prove
-    // availability.
+    // Any exhausted known window proves exhaustion. Weekly-only Pro has no
+    // five-hour requirement; never infer that policy from a missing tier alone.
     if five_hour_used.is_some_and(|used| used > 95.0)
         || weekly_used.is_some_and(|used| used >= 100.0)
     {
         return Ok(QuotaDecision::Exhausted);
     }
-    if five_hour_used.is_none() || weekly_used.is_none() {
+    if weekly_used.is_none() || (five_hour_used.is_none() && !has_weekly_only_policy(quota)) {
         return Err("缺少有效的 5 小时或周额度窗口".into());
     }
     Ok(QuotaDecision::Usable)
 }
 
-/// The active account may keep exactly 5% remaining, but a replacement must
-/// have strictly more than 5%. Smaller usage ranks ahead of larger usage.
-fn candidate_five_hour_used(quota: &SubscriptionQuota) -> Result<Option<f64>, String> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CandidateCapacity {
+    FiveHour(f64),
+    WeeklyOnly,
+}
+
+impl CandidateCapacity {
+    // Weekly-only and a completely unused five-hour window share the highest
+    // availability band. Ties preserve original list order without inventing
+    // a five-hour utilization value for Pro.
+    fn better_than(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::FiveHour(used), Self::FiveHour(previous)) => used < previous,
+            (Self::WeeklyOnly, Self::FiveHour(previous)) => previous > 0.0,
+            _ => false,
+        }
+    }
+
+    fn is_maximum(self) -> bool {
+        matches!(self, Self::WeeklyOnly | Self::FiveHour(0.0))
+    }
+}
+
+/// A replacement needs strictly more than 5% when it has a five-hour window;
+/// explicitly weekly-only Pro needs a valid, unexhausted weekly window.
+fn candidate_capacity(quota: &SubscriptionQuota) -> Result<Option<CandidateCapacity>, String> {
     if !matches!(
         quota.credential_status,
         crate::services::subscription::CredentialStatus::Valid
@@ -792,7 +829,12 @@ fn candidate_five_hour_used(quota: &SubscriptionQuota) -> Result<Option<f64>, St
     if quota_decision(quota)? != QuotaDecision::Usable {
         return Ok(None);
     }
-    Ok(window_utilization(quota, TIER_FIVE_HOUR).filter(|used| *used < 95.0))
+    if has_weekly_only_policy(quota) {
+        return Ok(Some(CandidateCapacity::WeeklyOnly));
+    }
+    Ok(window_utilization(quota, TIER_FIVE_HOUR)
+        .filter(|used| *used < 95.0)
+        .map(CandidateCapacity::FiveHour))
 }
 
 async fn query_account(
@@ -910,7 +952,7 @@ where
     if sample_is_stale(target_checked_at, now()) {
         let target = query(target_account.into()).await?;
         check()?;
-        if candidate_five_hour_used(&target)?.is_none() {
+        if candidate_capacity(&target)?.is_none() {
             return Err("已选择的目标账号额度已不可用；本次不暂停或重开桌面".into());
         }
     }
@@ -1029,7 +1071,7 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
             status.target_provider_id = Some(wait.provider_id.clone());
             status.wait_until = Some(wait.reset_at);
         });
-        match candidate_five_hour_used(&current_quota) {
+        match candidate_capacity(&current_quota) {
             Ok(Some(_)) => {
                 match crate::services::codex_desktop_bridge::resume_quota_reset_wait(
                     app.clone(),
@@ -1071,7 +1113,10 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     }
     match quota_decision(&current_quota) {
         Ok(QuotaDecision::Usable) => {
-            let (phase, message) = usable_account_outcome(&lock_runtime(), &current);
+            let (phase, mut message) = usable_account_outcome(&lock_runtime(), &current);
+            if phase == "monitoring" && has_weekly_only_policy(&current_quota) {
+                message = "当前 Pro 账号无 5 小时窗口，周额度仍可使用；每 5 分钟检查周额度".into();
+            }
             finish(&app, generation, phase, message);
             return;
         }
@@ -1117,10 +1162,9 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     if let Some(target) = target {
         let target_checked_at = target.checked_at;
         log::info!(
-            "[CodexAutoSwitchSelection] provider={} five_hour_used={} five_hour_remaining={} checked_at={} candidate_requires_used_below=95",
+            "[CodexAutoSwitchSelection] provider={} capacity={:?} checked_at={} five_hour_candidate_requires_used_below=95",
             target.provider_id,
-            target.five_hour_used,
-            100.0 - target.five_hour_used,
+            target.capacity,
             target_checked_at,
         );
         let target = target.provider_id;
@@ -1356,13 +1400,13 @@ fn update_earliest_reset(
 #[derive(Debug)]
 struct SelectedCandidate {
     provider_id: String,
-    five_hour_used: f64,
+    capacity: CandidateCapacity,
     checked_at: u128,
 }
 
 /// Query candidates in their original order and select the most 5h remaining.
-/// Equal results keep the earlier account. An unused window is the theoretical
-/// maximum, so later candidates cannot improve it and are not queried.
+/// Equal results keep the earlier account. A weekly-only Pro account or an
+/// unused five-hour window reaches the maximum band and stops further queries.
 #[cfg(test)]
 async fn select_most_remaining<Q, F, C>(
     providers: indexmap::IndexMap<String, Provider>,
@@ -1426,10 +1470,10 @@ where
         check()?;
         match result.and_then(|quota| {
             update_earliest_reset(&mut earliest_reset, &id, &quota);
-            candidate_five_hour_used(&quota).map(|used| {
-                used.map(|five_hour_used| SelectedCandidate {
+            candidate_capacity(&quota).map(|capacity| {
+                capacity.map(|capacity| SelectedCandidate {
                     provider_id: id.clone(),
-                    five_hour_used,
+                    capacity,
                     checked_at: quota
                         .queried_at
                         .and_then(|timestamp| u128::try_from(timestamp).ok())
@@ -1440,20 +1484,20 @@ where
             Ok(Some(candidate)) => {
                 if selected
                     .as_ref()
-                    .is_none_or(|best| candidate.five_hour_used < best.five_hour_used)
+                    .is_none_or(|best| candidate.capacity.better_than(best.capacity))
                 {
                     selected = Some(candidate);
                 }
                 if selected
                     .as_ref()
-                    .is_some_and(|best| best.five_hour_used == 0.0)
+                    .is_some_and(|best| best.capacity.is_maximum())
                 {
                     return Ok((selected, failures, earliest_reset));
                 }
             }
             Ok(None) => {
                 failures.push(format!(
-                    "{}：候选账号需 5 小时剩余严格大于 5%，且周额度未耗尽",
+                    "{}：候选账号需周额度未耗尽；有 5 小时窗口时剩余须严格大于 5%",
                     id
                 ));
             }
@@ -1509,7 +1553,7 @@ mod tests {
         ] {
             let mut response = quota(0.0, 0.0);
             response.credential_status = invalid;
-            assert!(candidate_five_hour_used(&response).is_err());
+            assert!(candidate_capacity(&response).is_err());
         }
     }
     use crate::provider::{AuthBinding, AuthBindingSource, ProviderMeta};
@@ -2272,6 +2316,7 @@ mod tests {
                 },
             ],
             extra_usage: None,
+            codex_limit_policy: None,
             error: None,
             queried_at: None,
         }
@@ -2303,16 +2348,13 @@ mod tests {
             quota_decision(&quota(95.0, 99.0)).unwrap(),
             QuotaDecision::Usable
         );
-        assert_eq!(candidate_five_hour_used(&quota(95.0, 99.0)).unwrap(), None);
+        assert_eq!(candidate_capacity(&quota(95.0, 99.0)).unwrap(), None);
         assert_eq!(
-            candidate_five_hour_used(&quota(94.99999, 99.0)).unwrap(),
-            Some(94.99999)
+            candidate_capacity(&quota(94.99999, 99.0)).unwrap(),
+            Some(CandidateCapacity::FiveHour(94.99999))
         );
-        assert_eq!(
-            candidate_five_hour_used(&quota(95.00001, 99.0)).unwrap(),
-            None
-        );
-        assert_eq!(candidate_five_hour_used(&quota(0.0, 100.0)).unwrap(), None);
+        assert_eq!(candidate_capacity(&quota(95.00001, 99.0)).unwrap(), None);
+        assert_eq!(candidate_capacity(&quota(0.0, 100.0)).unwrap(), None);
     }
 
     #[test]
@@ -2322,6 +2364,124 @@ mod tests {
         assert!(quota_decision(&value).is_err());
         value = quota(f64::NAN, 0.0);
         assert!(quota_decision(&value).is_err());
+    }
+
+    fn weekly_only_quota(weekly_used: f64) -> SubscriptionQuota {
+        let mut value = quota(0.0, weekly_used);
+        value.tiers.remove(0);
+        value.codex_limit_policy = Some(CodexLimitPolicy::WeeklyOnly);
+        value
+    }
+
+    #[test]
+    fn confirmed_weekly_only_pro_uses_only_the_weekly_threshold() {
+        for used in [0.0, 18.0, 99.0, 99.999] {
+            let value = weekly_only_quota(used);
+            assert_eq!(quota_decision(&value).unwrap(), QuotaDecision::Usable);
+            assert_eq!(
+                candidate_capacity(&value).unwrap(),
+                Some(CandidateCapacity::WeeklyOnly)
+            );
+        }
+        for used in [100.0, 101.0] {
+            let value = weekly_only_quota(used);
+            assert_eq!(quota_decision(&value).unwrap(), QuotaDecision::Exhausted);
+            assert_eq!(candidate_capacity(&value).unwrap(), None);
+            assert_eq!(candidate_wait_reset(&value), None);
+        }
+    }
+
+    #[test]
+    fn missing_five_hour_tier_does_not_implicitly_confirm_weekly_only_pro() {
+        let mut value = weekly_only_quota(18.0);
+        value.codex_limit_policy = None;
+        assert!(quota_decision(&value).is_err());
+        assert!(candidate_capacity(&value).is_err());
+        value.codex_limit_policy = Some(CodexLimitPolicy::WeeklyOnly);
+        value.tiers.push(quota(f64::NAN, 0.0).tiers.remove(0));
+        assert!(quota_decision(&value).is_err());
+        assert!(candidate_capacity(&value).is_err());
+    }
+
+    #[test]
+    fn weekly_only_policy_does_not_bypass_login_or_invalid_weekly_usage() {
+        for used in [f64::NAN, f64::INFINITY, -1.0] {
+            let value = weekly_only_quota(used);
+            assert!(quota_decision(&value).is_err());
+            assert!(candidate_capacity(&value).is_err());
+        }
+        let mut value = weekly_only_quota(18.0);
+        value.credential_status = CredentialStatus::Expired;
+        assert!(quota_decision(&value).is_err());
+        assert!(candidate_capacity(&value).is_err());
+        value.credential_status = CredentialStatus::Valid;
+        value.success = false;
+        assert!(quota_decision(&value).is_err());
+    }
+
+    #[test]
+    fn weekly_only_and_unused_windows_share_the_best_band_without_fake_usage() {
+        assert!(CandidateCapacity::WeeklyOnly.better_than(CandidateCapacity::FiveHour(1.0)));
+        assert!(!CandidateCapacity::WeeklyOnly.better_than(CandidateCapacity::FiveHour(0.0)));
+        assert!(!CandidateCapacity::FiveHour(0.0).better_than(CandidateCapacity::WeeklyOnly));
+        assert!(CandidateCapacity::WeeklyOnly.is_maximum());
+        assert!(CandidateCapacity::FiveHour(0.0).is_maximum());
+    }
+
+    #[tokio::test]
+    async fn weekly_only_pro_candidate_stops_queries_once_maximum_is_found() {
+        let providers = indexmap::IndexMap::from([
+            ("current".into(), card("current", "a")),
+            ("used".into(), card("used", "b")),
+            ("pro".into(), card("pro", "c")),
+            ("later".into(), card("later", "d")),
+        ]);
+        let queried = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let calls = queried.clone();
+        let (selected, _) = select_most_remaining(
+            providers,
+            "current",
+            "a",
+            move |account| {
+                calls.lock().unwrap().push(account.clone());
+                async move {
+                    Ok(if account == "c" {
+                        weekly_only_quota(18.0)
+                    } else {
+                        quota(10.0, 0.0)
+                    })
+                }
+            },
+            || Ok(()),
+        )
+        .await
+        .unwrap();
+        let selected = selected.unwrap();
+        assert_eq!(selected.provider_id, "pro");
+        assert_eq!(selected.capacity, CandidateCapacity::WeeklyOnly);
+        assert_eq!(*queried.lock().unwrap(), vec!["b", "c"]);
+    }
+
+    #[tokio::test]
+    async fn weekly_only_source_recovery_invalidates_stale_switch_without_target_query() {
+        let queried = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let calls = queried.clone();
+        let needed = revalidate_quota_samples(
+            "source",
+            "target",
+            0,
+            0,
+            move |account| {
+                calls.lock().unwrap().push(account);
+                async { Ok(weekly_only_quota(18.0)) }
+            },
+            || Ok(()),
+            || PLAN_MAX_AGE_MS + 1,
+        )
+        .await
+        .unwrap();
+        assert!(!needed);
+        assert_eq!(*queried.lock().unwrap(), vec!["source"]);
     }
 
     #[test]
