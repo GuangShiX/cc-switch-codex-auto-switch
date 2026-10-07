@@ -17,7 +17,7 @@ vi.mock("@/components/SubscriptionQuotaFooter", () => ({
 }));
 
 describe("Codex OAuth quota card", () => {
-  it("does not query inactive managed cards when the provider list mounts", () => {
+  it("loads inactive managed cards initially without enabling their polling", () => {
     quotaHook.mockReturnValue({
       data: undefined,
       isFetching: false,
@@ -27,7 +27,7 @@ describe("Codex OAuth quota card", () => {
     render(<CodexOauthQuotaFooter isCurrent={false} />);
 
     expect(quotaHook).toHaveBeenCalledWith(undefined, {
-      enabled: false,
+      enabled: true,
       autoQuery: false,
       autoQueryIntervalMinutes: 5,
     });

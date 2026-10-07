@@ -31,11 +31,9 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useCodexOauthQuota(meta, {
-    // Only the active card performs its automatic first query. Disabled cards
-    // must not fan out refresh requests for every managed account when the
-    // provider list is rendered; their explicit Refresh button still calls
-    // the React Query refetch function when the user asks for that account.
-    enabled: isCurrent,
+    // Every account loads its initial quota; only the current account polls.
+    // Shared account query keys reuse fresh cached/native results on remount.
+    enabled: true,
     autoQuery: isCurrent && autoQueryInterval > 0,
     autoQueryIntervalMinutes: autoQueryInterval,
   });
