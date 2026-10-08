@@ -71,6 +71,21 @@ struct Runtime {
     started_at: Option<u128>,
     session_epoch: Option<u64>,
     last_desktop_followup_failure: Option<(String, String)>,
+    last_check_failure: Option<CheckFailure>,
+}
+
+/// Repeated timer checks may rediscover an unresolved problem without making
+/// a new switch attempt. Correlate those observations by their actual context,
+/// not by the fresh operation UUID or generation reserved for each check.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CheckFailure {
+    phase: String,
+    source: String,
+    stage: String,
+    current_provider_id: Option<String>,
+    target_provider_id: Option<String>,
+    message: String,
+    candidate_failures: Vec<String>,
 }
 
 impl Default for Runtime {
@@ -84,6 +99,7 @@ impl Default for Runtime {
             started_at: None,
             session_epoch: None,
             last_desktop_followup_failure: None,
+            last_check_failure: None,
         }
     }
 }
@@ -171,7 +187,7 @@ fn finish(app: &tauri::AppHandle, generation: u64, phase: &str, message: String)
         inner.status.phase = phase.into();
         inner.status.message = message;
         inner.status.can_cancel = has_uncertain_recovery;
-        let failure_context = if matches!(phase, "blocked" | "failed" | "waiting") {
+        let failure_context = if should_record_failure(&mut inner, phase, source, &failed_stage) {
             Some((
                 inner.status.current_provider_id.clone(),
                 inner.status.target_provider_id.clone(),
@@ -210,6 +226,33 @@ fn finish(app: &tauri::AppHandle, generation: u64, phase: &str, message: String)
         );
     }
     publish(app, &status);
+}
+
+fn should_record_failure(inner: &mut Runtime, phase: &str, source: &str, stage: &str) -> bool {
+    if !matches!(phase, "blocked" | "failed" | "waiting") {
+        if matches!(phase, "monitoring" | "completed") {
+            inner.last_check_failure = None;
+        }
+        return false;
+    }
+    let failure = CheckFailure {
+        phase: phase.into(),
+        source: source.into(),
+        stage: stage.into(),
+        current_provider_id: inner.status.current_provider_id.clone(),
+        target_provider_id: inner.status.target_provider_id.clone(),
+        message: inner.status.message.clone(),
+        candidate_failures: inner.status.candidate_failures.clone(),
+    };
+    let observation_only =
+        source != "manual" && matches!(stage, "checking" | "selecting" | "preflight" | "waiting");
+    if observation_only && inner.last_check_failure.as_ref() == Some(&failure) {
+        return false;
+    }
+    // Explicit user retries and failures after side effects remain individual
+    // audit events, even if the error text matches the previous attempt.
+    inner.last_check_failure = Some(failure);
+    true
 }
 
 fn begin_operation(app: &tauri::AppHandle, reason: &str, preempt: bool) -> Option<u64> {
@@ -379,6 +422,7 @@ fn apply_enabled_choice(
     inner.generation = inner.generation.wrapping_add(1);
     inner.running = false;
     inner.started_at = None;
+    inner.last_check_failure = None;
     inner.status.phase = if enabled { "monitoring" } else { "disabled" }.into();
     inner.status.message = if enabled {
         "每 5 分钟后台监测已启用"
@@ -426,6 +470,7 @@ fn invalidate_locked(inner: &mut Runtime, reason: &str) {
     inner.started_at = None;
     inner.session_epoch = None;
     inner.last_desktop_followup_failure = None;
+    inner.last_check_failure = None;
     inner.status.phase = if inner.status.enabled {
         "cancelled"
     } else {
@@ -465,6 +510,7 @@ pub fn invalidate_pending_with_generation(reason: &str) -> u64 {
     inner.started_at = Some(now_millis());
     inner.session_epoch = crate::services::codex_session_watch::current_epoch_if_ready();
     inner.last_desktop_followup_failure = None;
+    inner.last_check_failure = None;
     inner.status.phase = "enabling".into();
     inner.status.message = reason.into();
     inner.status.operation_id = Some(uuid::Uuid::new_v4().to_string());
@@ -961,10 +1007,6 @@ where
 }
 
 async fn run_automatic(app: tauri::AppHandle, generation: u64) {
-    if let Some(reason) = crate::services::codex_desktop_bridge::pending_recovery_reason() {
-        finish(&app, generation, "blocked", reason);
-        return;
-    }
     let state = app.state::<AppState>();
     let current = match ProviderService::current(&state, AppType::Codex) {
         Ok(id) if !id.is_empty() => id,
@@ -1050,6 +1092,23 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     };
     let current_checked_at = now_millis();
     if plan_is_current(&app, generation, &current).is_err() {
+        return;
+    }
+    // A previous desktop recovery must not freeze quota monitoring. Refresh
+    // the current account first, then reconcile only provably obsolete tickets.
+    if let Err(error) = crate::services::codex_desktop_bridge::reconcile_obsolete_recovery(
+        &app, generation, &current,
+    )
+    .await
+    {
+        finish(&app, generation, "blocked", error);
+        return;
+    }
+    if plan_is_current(&app, generation, &current).is_err() {
+        return;
+    }
+    if let Some(reason) = crate::services::codex_desktop_bridge::pending_recovery_reason() {
+        finish(&app, generation, "blocked", reason);
         return;
     }
     if let Some(wait) = waiting {
@@ -1543,6 +1602,161 @@ pub fn cancel_codex_auto_switch(app: tauri::AppHandle) -> CodexAutoSwitchStatus 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blocked_check() -> Runtime {
+        let mut inner = Runtime::default();
+        inner.status.phase = "blocked".into();
+        inner.status.message = "fixture unresolved desktop recovery".into();
+        inner.status.current_provider_id = Some("fixture-current".into());
+        inner.status.can_cancel = true;
+        inner
+    }
+
+    #[test]
+    fn repeated_check_failure_ignores_new_generation_and_operation_id() {
+        let mut inner = blocked_check();
+        inner.generation = 7;
+        inner.status.operation_id = Some("fixture-first-operation".into());
+        assert!(should_record_failure(
+            &mut inner,
+            "blocked",
+            "automatic",
+            "checking"
+        ));
+        inner.generation = 8;
+        inner.status.operation_id = Some("fixture-next-operation".into());
+        assert!(!should_record_failure(
+            &mut inner,
+            "blocked",
+            "automatic",
+            "checking"
+        ));
+        // De-duplicating history is not cancellation, clearing the warning,
+        // or granting an older worker permission to continue.
+        assert_eq!(inner.generation, 8);
+        assert_eq!(inner.status.phase, "blocked");
+        assert!(inner.status.can_cancel);
+        assert_eq!(
+            inner.status.operation_id.as_deref(),
+            Some("fixture-next-operation")
+        );
+    }
+
+    #[test]
+    fn check_failure_context_changes_are_each_recorded_once() {
+        let mut inner = blocked_check();
+        assert!(should_record_failure(
+            &mut inner,
+            "blocked",
+            "automatic",
+            "checking"
+        ));
+        for change in 0..4 {
+            match change {
+                0 => inner.status.current_provider_id = Some("fixture-other-current".into()),
+                1 => inner.status.target_provider_id = Some("fixture-new-target".into()),
+                2 => inner.status.message = "fixture different blocker".into(),
+                _ => inner
+                    .status
+                    .candidate_failures
+                    .push("fixture changed quota".into()),
+            }
+            assert!(should_record_failure(
+                &mut inner,
+                "blocked",
+                "automatic",
+                "checking"
+            ));
+            assert!(!should_record_failure(
+                &mut inner,
+                "blocked",
+                "automatic",
+                "checking"
+            ));
+        }
+        assert!(should_record_failure(
+            &mut inner,
+            "blocked",
+            "reset-wait",
+            "checking"
+        ));
+        assert!(!should_record_failure(
+            &mut inner,
+            "blocked",
+            "reset-wait",
+            "checking"
+        ));
+        assert!(should_record_failure(
+            &mut inner,
+            "blocked",
+            "reset-wait",
+            "preflight"
+        ));
+    }
+
+    #[test]
+    fn manual_retries_and_actual_lifecycle_failures_are_not_de_duplicated() {
+        let mut inner = blocked_check();
+        for (source, stage) in [
+            ("manual", "checking"),
+            ("manual", "preflight"),
+            ("automatic", "pausing"),
+            ("automatic", "closing"),
+            ("automatic", "enabling"),
+            ("automatic", "starting"),
+            ("automatic", "verifying"),
+            ("automatic", "resuming"),
+            ("reset-wait", "resuming"),
+        ] {
+            for _ in 0..2 {
+                assert!(should_record_failure(&mut inner, "blocked", source, stage));
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_warning_allows_a_later_recurrence_to_be_recorded() {
+        for resolved_phase in ["monitoring", "completed"] {
+            let mut inner = blocked_check();
+            assert!(should_record_failure(
+                &mut inner,
+                "blocked",
+                "automatic",
+                "checking"
+            ));
+            assert!(!should_record_failure(
+                &mut inner,
+                resolved_phase,
+                "automatic",
+                "checking"
+            ));
+            assert!(inner.last_check_failure.is_none());
+            assert!(should_record_failure(
+                &mut inner,
+                "blocked",
+                "automatic",
+                "checking"
+            ));
+        }
+    }
+
+    #[test]
+    fn an_explicit_toggle_rearms_failure_history_but_redundant_enable_does_not() {
+        let mut inner = blocked_check();
+        inner.status.enabled = true;
+        assert!(should_record_failure(
+            &mut inner,
+            "blocked",
+            "automatic",
+            "checking"
+        ));
+        apply_enabled_choice(&mut inner, true, || {
+            panic!("must not cancel a redundant enable")
+        });
+        assert!(inner.last_check_failure.is_some());
+        apply_enabled_choice(&mut inner, false, || Ok(()));
+        assert!(inner.last_check_failure.is_none());
+    }
 
     #[test]
     fn apparently_successful_quota_does_not_override_invalid_candidate_login_status() {

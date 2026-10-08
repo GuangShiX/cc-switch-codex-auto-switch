@@ -367,12 +367,12 @@ fn validate_process_binding(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn verify_process_binding(_: u32, _: u64, _: u16) -> Result<(), String> {
+pub(crate) fn verify_process_binding(_: u32, _: u64, _: u16) -> Result<(), String> {
     Err(UNCONFIRMED.into())
 }
 
 #[cfg(target_os = "windows")]
-fn verify_process_binding(pid: u32, birth: u64, port: u16) -> Result<(), String> {
+pub(crate) fn verify_process_binding(pid: u32, birth: u64, port: u16) -> Result<(), String> {
     use std::ptr::null_mut;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, HANDLE},

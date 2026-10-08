@@ -5,7 +5,8 @@
 use crate::app_config::AppType;
 use crate::services::codex_desktop_identity::{self as identity, DesktopIdentity};
 use crate::services::codex_desktop_session::{
-    self, DesktopSession, PausedTask, ResumeConfirmation, TaskInventory, TaskSnapshot,
+    self, DesktopSession, PausedTask, ResumeConfirmation, SessionError, SessionErrorKind,
+    TaskInventory, TaskSnapshot,
 };
 use crate::services::ProviderService;
 use crate::services::{codex_auto_switch as monitor, codex_desktop_restart as restart};
@@ -280,6 +281,258 @@ pub fn pending_recovery_reason() -> Option<String> {
         }
     }
     None
+}
+
+fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
+    if record.phase != "needs-review"
+        || record.target_provider_id != current
+        || !record.desktop_restarted
+        || !record.runtime_identity_confirmed
+        || record.reopened_pid.is_none()
+        || record.reopened_birth.is_none()
+        || record.reopened_port.is_none()
+        || record.wait_until.is_some()
+        || record.paused_tasks.is_empty()
+        || !record.resume_intents.is_empty()
+        || !record.settings_restore_intents.is_empty()
+        || !record.settings_restored_tasks.is_empty()
+        || !record.resumed_tasks.is_empty()
+        || !record.resume_confirmations.is_empty()
+        || record.planned_tasks.len() != record.paused_tasks.len()
+    {
+        return false;
+    }
+    let mut ids = std::collections::HashSet::new();
+    record.paused_tasks.iter().all(|saved| {
+        if saved.pause_operation_id != record.operation_id || !ids.insert(&saved.thread_id) {
+            return false;
+        }
+        let Some(planned) = record
+            .planned_tasks
+            .iter()
+            .find(|task| task.thread_id == saved.thread_id)
+        else {
+            return false;
+        };
+        match saved.origin {
+            codex_desktop_session::RecoveryOrigin::CcSwitchPause => {
+                if !planned.safely_running() {
+                    return false;
+                }
+                // Validate the serialized pause confirmation through the same
+                // exact-origin predicate used before shutdown; no private flag
+                // is inferred from just the fact that a ticket exists.
+                let mut baseline = planned.clone();
+                baseline.status = Some("interrupted".into());
+                baseline.runtime_status = "idle".into();
+                baseline.matches_paused(saved)
+            }
+            codex_desktop_session::RecoveryOrigin::QuotaExhausted => planned.matches_paused(saved),
+        }
+    })
+}
+
+fn saved_task_was_changed(saved: &PausedTask, actual: &TaskSnapshot) -> bool {
+    if actual.thread_id != saved.thread_id
+        || actual.is_child
+        || actual.ephemeral
+        || actual.matches_paused(saved)
+        || actual.turn_id.as_deref().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let new_turn = actual.turn_id.as_deref() != Some(saved.turn_id.as_str());
+    let known_idle = actual.safely_idle()
+        && matches!(
+            actual.status.as_deref(),
+            Some("completed" | "interrupted" | "failed")
+        );
+    if new_turn && (actual.safely_running() || known_idle || actual.safely_quota_failed()) {
+        return true;
+    }
+    // A real request for user input/approval also invalidates the owned pause.
+    // Unknown runtime flags and unconfirmed submission are never terminal proof.
+    if actual.waiting
+        && matches!(
+            actual.waiting_reason,
+            Some(
+                codex_desktop_session::WaitingReason::PendingApproval
+                    | codex_desktop_session::WaitingReason::PendingUserInput
+                    | codex_desktop_session::WaitingReason::PendingElicitation
+            )
+        )
+    {
+        return true;
+    }
+    actual.safely_idle() && actual.status.as_deref() == Some("completed")
+}
+
+fn all_saved_tasks_were_changed(record: &RecoveryRecord, inventory: &TaskInventory) -> bool {
+    inventory.candidate_coverage_complete
+        && !record.paused_tasks.is_empty()
+        && record.paused_tasks.iter().all(|saved| {
+            let mut matches = inventory
+                .running
+                .iter()
+                .chain(inventory.idle.iter())
+                .chain(inventory.quota_failed.iter())
+                .chain(inventory.blocked.iter())
+                .filter(|task| task.thread_id == saved.thread_id);
+            matches.next().is_some_and(|actual| {
+                matches.next().is_none() && saved_task_was_changed(saved, actual)
+            })
+        })
+}
+
+/// A failed restoration with no sent continuation is obsolete only once every
+/// owned ticket has demonstrably been continued/changed by the user. This reads
+/// the existing desktop and commits a journal terminal state; it never starts,
+/// interrupts, navigates, activates an account or repeats an uncertain action.
+pub async fn reconcile_obsolete_recovery(
+    app: &tauri::AppHandle,
+    generation: u64,
+    current: &str,
+) -> Result<usize, String> {
+    let Ok(_flow) = FLOW_LOCK.try_lock() else {
+        return Ok(0);
+    };
+    check_selection(app, generation, current)?;
+    let directory = crate::config::get_app_config_dir().join("codex-desktop-recovery");
+    let paths = match std::fs::read_dir(&directory) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "无法只读核对旧恢复记录")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(_) => return Err("无法只读核对旧恢复记录".into()),
+    };
+    let mut reconciled = 0;
+    for path in paths {
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let value = read_recovery_value(&path)?;
+        if value["phase"] != "needs-review" {
+            continue;
+        }
+        let record = read_record(&path)?;
+        if !obsolete_recovery_candidate(&record, current) {
+            continue;
+        }
+        let receipt = receipt_for_wait(&record)?;
+        let guard_app = app.clone();
+        let guard_current = current.to_owned();
+        let guard_receipt = receipt.clone();
+        let guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync> = Arc::new(move || {
+            check_selection(&guard_app, generation, &guard_current)?;
+            restart::ensure_identity_desktop(&guard_receipt)
+        });
+        guard()?;
+        // Use the already owned live login, not target_identity(), which can
+        // refresh OAuth tokens. No credentials or identity values are logged.
+        let expected = current_login_identity(app, current).await?;
+        guard()?;
+        confirm_identity_receipt(&expected, &receipt, &guard).await?;
+        let (_session, inventory) = snapshot_original_desktop(guard.as_ref()).await?;
+        if !all_saved_tasks_were_changed(&record, &inventory) {
+            continue;
+        }
+        guard()?;
+        if supersede_obsolete_recovery(&path, &value, &record.paused_tasks, guard.as_ref())? {
+            reconciled += 1;
+        }
+    }
+    Ok(reconciled)
+}
+
+async fn current_login_identity(
+    app: &tauri::AppHandle,
+    provider_id: &str,
+) -> Result<DesktopIdentity, String> {
+    let state = app.state::<AppState>();
+    let provider = state
+        .db
+        .get_provider_by_id(provider_id, AppType::Codex.as_str())
+        .map_err(|error| error.to_string())?
+        .ok_or("旧恢复记录的当前供应商已移除")?;
+    let account = provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+        .ok_or("旧恢复记录的当前供应商没有托管身份")?;
+    let auth = crate::config::read_json_file::<serde_json::Value>(
+        &crate::codex_config::get_codex_auth_path(),
+    )
+    .map_err(|_| "无法只读核对当前登录身份；旧恢复记录保持待处理")?;
+    if !crate::codex_config::codex_auth_matches_recorded_managed_oauth(&auth, &account)
+        .map_err(|_| "无法只读核对当前托管登录归属")?
+    {
+        return Err("当前登录归属与托管账号不一致；旧恢复记录保持待处理".into());
+    }
+    let expected = identity::identity_from_token(
+        auth.pointer("/tokens/access_token")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("当前登录缺少可只读核对的身份")?,
+    )?;
+    let workspace = state
+        .codex_oauth_manager
+        .chatgpt_account_id_for_account(&account)
+        .await
+        .map_err(|_| "当前托管账号的工作区无法只读确认")?;
+    if expected.account_id != workspace {
+        return Err("当前登录与托管工作区不一致；旧恢复记录保持待处理".into());
+    }
+    Ok(expected)
+}
+
+fn supersede_obsolete_recovery(
+    path: &std::path::Path,
+    expected: &serde_json::Value,
+    saved: &[PausedTask],
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<bool, String> {
+    use std::io::Write;
+    let _record_lock = RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard()?;
+    let mut value = read_recovery_value(path)?;
+    if value != *expected {
+        return Ok(false);
+    }
+    value["phase"] = serde_json::json!("superseded");
+    if value["abandonedTasks"].is_null() {
+        value["abandonedTasks"] = serde_json::json!([]);
+    }
+    let abandoned = value["abandonedTasks"]
+        .as_array_mut()
+        .ok_or("旧恢复记录的失效任务列表无法核对")?;
+    for task in saved {
+        if !abandoned
+            .iter()
+            .any(|id| id.as_str() == Some(task.thread_id.as_str()))
+        {
+            abandoned.push(serde_json::json!(task.thread_id));
+        }
+    }
+    value["supersededReason"] = serde_json::json!(
+        "只读核对确认本次保存的原任务均已被继续、完成或等待用户处理；旧计划失效，未重放任何操作"
+    );
+    let encoded = serde_json::to_vec(&value).map_err(|_| "无法编码旧恢复记录终态")?;
+    if encoded.len() > 1_048_576 {
+        return Err("旧恢复记录终态超出安全读取上限；保持原记录待处理".into());
+    }
+    let mut file = tempfile::NamedTempFile::new_in(path.parent().ok_or("旧恢复记录路径无效")?)
+        .map_err(|_| "无法保存旧恢复记录终态")?;
+    file.write_all(&encoded)
+        .map_err(|_| "无法编码旧恢复记录终态")?;
+    file.flush().map_err(|_| "无法刷新旧恢复记录终态")?;
+    file.as_file()
+        .sync_all()
+        .map_err(|_| "无法同步旧恢复记录终态")?;
+    guard()?;
+    file.persist(path).map_err(|_| "无法提交旧恢复记录终态")?;
+    Ok(true)
 }
 
 /// Capture existing journal paths before invalidating the user's operation.
@@ -620,7 +873,10 @@ pub async fn resume_quota_reset_wait(
     wait: QuotaResetWait,
     generation: u64,
 ) -> Result<String, String> {
-    let _flow = FLOW_LOCK.lock().await;
+    restart::ensure_no_shutdown_pending()?;
+    let _flow = FLOW_LOCK
+        .try_lock()
+        .map_err(|_| "另一桌面流程仍在处理；本次未排队继续原任务")?;
     monitor::plan_is_current(&app, generation, &wait.provider_id)?;
     let mut record = read_record(&wait_record_path(&wait.operation_id)?)?;
     if record.phase != "waiting-for-reset"
@@ -750,7 +1006,10 @@ async fn run_lifecycle(
     automatic: bool,
     wait_until: Option<i64>,
 ) -> Result<(bool, String), String> {
-    let _flow = FLOW_LOCK.lock().await;
+    restart::ensure_no_shutdown_pending()?;
+    let _flow = FLOW_LOCK
+        .try_lock()
+        .map_err(|_| "另一桌面流程仍在处理；本次未排队关闭或重开")?;
     check_selection(&app, generation, &source)?;
     if !automatic {
         check_target_login(&app, &target)?;
@@ -819,17 +1078,11 @@ async fn run_lifecycle(
             "preflight",
             "正在核对桌面任务，不读取旧聊天全文",
         );
-        let ids = codex_desktop_session::discover_thread_ids(
-            &crate::codex_config::get_codex_config_dir(),
-        )
-        .map_err(|e| e.to_string())?;
-        let mut session = DesktopSession::connect().await.map_err(|e| e.to_string())?;
-        let mut inventory = session
-            .snapshot_safe_running_tasks(&ids)
-            .await
-            .map_err(|e| e.to_string())?;
-        inventory.candidate_coverage_complete = true;
-        restart::ensure_same_desktop(&desktop_receipt)?;
+        let snapshot_guard = || {
+            check_selection(&app, generation, &source)?;
+            restart::ensure_same_desktop(&desktop_receipt)
+        };
+        let (mut session, inventory) = snapshot_original_desktop(&snapshot_guard).await?;
         if !inventory.safe_to_restart() {
             return Err(format!(
                 "桌面有等待审批或状态未确认的任务（{}）；未关闭桌面",
@@ -917,17 +1170,7 @@ async fn run_lifecycle(
         // Fresh connection + freshly discovered metadata also checks tasks
         // started or changed while quota queries / interruptions were running.
         drop(session);
-        check_selection(&app, generation, &source)?;
-        let fresh_ids = codex_desktop_session::discover_thread_ids(
-            &crate::codex_config::get_codex_config_dir(),
-        )
-        .map_err(|e| e.to_string())?;
-        let mut verifier = DesktopSession::connect().await.map_err(|e| e.to_string())?;
-        let mut latest = verifier
-            .snapshot_safe_running_tasks(&fresh_ids)
-            .await
-            .map_err(|e| e.to_string())?;
-        latest.candidate_coverage_complete = true;
+        let (_verifier, latest) = snapshot_original_desktop(&snapshot_guard).await?;
         if !latest.safe_to_restart() || !latest.running.is_empty() {
             record.phase = "state-changed-needs-review".into();
             record.persist()?;
@@ -981,7 +1224,14 @@ async fn run_lifecycle(
     let before_shutdown: Box<dyn FnOnce() -> Result<(), String> + Send> = Box::new(move || {
         final_guard()?;
         restart::ensure_same_desktop(&final_receipt)?;
-        runtime.block_on(confirm_tasks_before_shutdown(&final_paused))?;
+        let snapshot_guard = || {
+            final_guard()?;
+            restart::ensure_same_desktop(&final_receipt)
+        };
+        runtime.block_on(confirm_tasks_before_shutdown(
+            &final_paused,
+            &snapshot_guard,
+        ))?;
         final_guard()?;
         restart::ensure_same_desktop(&final_receipt)
     });
@@ -1256,17 +1506,86 @@ async fn resume_saved_tasks(
     Ok(())
 }
 
-async fn confirm_tasks_before_shutdown(paused: &[PausedTask]) -> Result<(), String> {
-    let ids =
-        codex_desktop_session::discover_thread_ids(&crate::codex_config::get_codex_config_dir())
-            .map_err(|e| e.to_string())?;
-    let mut session = DesktopSession::connect().await.map_err(|e| e.to_string())?;
-    let mut inventory = session
-        .snapshot_safe_running_tasks(&ids)
-        .await
-        .map_err(|e| e.to_string())?;
-    inventory.candidate_coverage_complete = true;
+async fn confirm_tasks_before_shutdown(
+    paused: &[PausedTask],
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<(), String> {
+    let (_session, inventory) = snapshot_original_desktop(guard).await?;
     validate_tasks_before_shutdown(&inventory, paused)
+}
+
+const ORIGINAL_SNAPSHOT_ATTEMPTS: usize = 3;
+const ORIGINAL_SNAPSHOT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const READONLY_GUARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Only read-only connection + task inventory attempts belong here. A broken
+/// connection discards its partial snapshot; a new attempt discovers all IDs
+/// again. Never pass pause, shutdown, activation or continuation to this helper.
+async fn guarded_readonly_snapshot<T, Read, ReadFuture>(
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+    retry_delay: std::time::Duration,
+    mut read: Read,
+) -> Result<T, String>
+where
+    Read: FnMut() -> ReadFuture,
+    ReadFuture: std::future::Future<Output = Result<T, SessionError>>,
+{
+    for attempt in 1..=ORIGINAL_SNAPSHOT_ATTEMPTS {
+        guard()?;
+        let reading = read();
+        tokio::pin!(reading);
+        let result = loop {
+            tokio::select! {
+                result = &mut reading => {
+                    guard()?;
+                    break result;
+                }
+                _ = tokio::time::sleep(READONLY_GUARD_INTERVAL) => guard()?,
+            }
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if error.kind == SessionErrorKind::Unavailable
+                    && !error.mutation_may_have_been_sent
+                    && attempt < ORIGINAL_SNAPSHOT_ATTEMPTS =>
+            {
+                log::info!(
+                    "Codex 原桌面只读盘点连接暂时断开；重新连接并完整核对（第 {attempt} 次）"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "原桌面任务只读核对失败（尝试 {attempt}/{ORIGINAL_SNAPSHOT_ATTEMPTS} 次）：{error}；未重放暂停、关闭、换号或继续操作"
+                ));
+            }
+        }
+    }
+    unreachable!("bounded read-only snapshot attempts always return")
+}
+
+async fn snapshot_original_desktop(
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<(DesktopSession, TaskInventory), String> {
+    guarded_readonly_snapshot(guard, ORIGINAL_SNAPSHOT_RETRY_DELAY, || async {
+        let guard_error = |message| SessionError {
+            kind: SessionErrorKind::Cancelled,
+            message,
+            mutation_may_have_been_sent: false,
+        };
+        // Metadata discovery is repeated on every attempt, not just connect.
+        let ids = codex_desktop_session::discover_thread_ids(
+            &crate::codex_config::get_codex_config_dir(),
+        )?;
+        guard().map_err(guard_error)?;
+        let mut session = DesktopSession::connect().await?;
+        guard().map_err(guard_error)?;
+        let mut inventory = session.snapshot_safe_running_tasks(&ids).await?;
+        inventory.candidate_coverage_complete = true;
+        Ok((session, inventory))
+    })
+    .await
 }
 
 fn validate_tasks_before_shutdown(
@@ -1294,6 +1613,189 @@ fn validate_tasks_before_shutdown(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn synthetic_read_error(kind: SessionErrorKind, mutation_sent: bool) -> SessionError {
+        SessionError {
+            kind,
+            message: "synthetic coordinator failure".into(),
+            mutation_may_have_been_sent: mutation_sent,
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_disconnect_discards_old_snapshot_and_accepts_fresh_full_inventory() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let result = guarded_readonly_snapshot(&|| Ok(()), std::time::Duration::ZERO, || {
+            let attempt = reads.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(if attempt == 0 {
+                Err(synthetic_read_error(SessionErrorKind::Unavailable, false))
+            } else {
+                Ok(vec!["original-chat", "chat-created-during-reconnect"])
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            result,
+            vec!["original-chat", "chat-created-during-reconnect"]
+        );
+    }
+
+    #[tokio::test]
+    async fn readonly_coordinator_disconnect_stops_after_three_attempts() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), _> =
+            guarded_readonly_snapshot(&|| Ok(()), std::time::Duration::ZERO, || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(synthetic_read_error(
+                    SessionErrorKind::Unavailable,
+                    false,
+                )))
+            })
+            .await;
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert!(result.unwrap_err().contains("尝试 3/3 次"));
+    }
+
+    #[tokio::test]
+    async fn readonly_inventory_never_retries_blocked_changed_or_uncertain_results() {
+        for kind in [
+            SessionErrorKind::Blocked,
+            SessionErrorKind::StateChanged,
+            SessionErrorKind::Cancelled,
+            SessionErrorKind::Unknown,
+            SessionErrorKind::Incompatible,
+            SessionErrorKind::OutcomeUnknown,
+        ] {
+            let reads = std::sync::atomic::AtomicUsize::new(0);
+            let result: Result<(), _> =
+                guarded_readonly_snapshot(&|| Ok(()), std::time::Duration::ZERO, || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(synthetic_read_error(kind, false)))
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(reads.load(Ordering::SeqCst), 1, "{kind:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_inventory_never_replays_a_possibly_sent_mutation() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), _> =
+            guarded_readonly_snapshot(&|| Ok(()), std::time::Duration::ZERO, || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(synthetic_read_error(
+                    SessionErrorKind::Unavailable,
+                    true,
+                )))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn readonly_reconnect_cancelled_after_failure_does_not_open_another_connection() {
+        let cancelled = AtomicBool::new(false);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let guard = || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err("synthetic operation cancelled".into())
+            } else {
+                Ok(())
+            }
+        };
+        let result: Result<(), _> =
+            guarded_readonly_snapshot(&guard, std::time::Duration::ZERO, || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                cancelled.store(true, Ordering::SeqCst);
+                std::future::ready(Err(synthetic_read_error(
+                    SessionErrorKind::Unavailable,
+                    false,
+                )))
+            })
+            .await;
+        assert_eq!(result.unwrap_err(), "synthetic operation cancelled");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn readonly_source_change_before_connection_stops_without_reading() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let result: Result<(), _> = guarded_readonly_snapshot(
+            &|| Err("synthetic current provider changed".into()),
+            std::time::Duration::ZERO,
+            || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "synthetic current provider changed");
+        assert_eq!(reads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn readonly_original_desktop_change_rejects_even_a_successful_snapshot() {
+        let same_desktop = AtomicBool::new(true);
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let guard = || {
+            if same_desktop.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("synthetic desktop receipt changed".into())
+            }
+        };
+        let result = guarded_readonly_snapshot(&guard, std::time::Duration::ZERO, || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            same_desktop.store(false, Ordering::SeqCst);
+            std::future::ready(Ok("old desktop snapshot"))
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "synthetic desktop receipt changed");
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn readonly_pending_read_is_cancelled_without_waiting_for_request_timeout() {
+        let cancelled = AtomicBool::new(false);
+        let guard = || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err("synthetic operation cancelled".into())
+            } else {
+                Ok(())
+            }
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            guarded_readonly_snapshot(&guard, std::time::Duration::ZERO, || async {
+                cancelled.store(true, Ordering::SeqCst);
+                std::future::pending::<Result<(), SessionError>>().await
+            }),
+        )
+        .await
+        .expect("guard should cancel a pending read before its own timeout");
+        assert_eq!(result.unwrap_err(), "synthetic operation cancelled");
+    }
+
+    #[tokio::test]
+    async fn readonly_unresolved_inventory_is_returned_once_for_existing_safety_checks() {
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+        let result = guarded_readonly_snapshot(&|| Ok(()), std::time::Duration::ZERO, || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(TaskInventory {
+                candidate_coverage_complete: true,
+                unresolved_thread_ids: vec!["unresolved-chat".into()],
+                ..Default::default()
+            }))
+        })
+        .await
+        .unwrap();
+        assert!(!result.safe_to_restart());
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn explicit_cancellation_clears_only_captured_uncertain_records_without_replay() {
@@ -1378,6 +1880,211 @@ mod tests {
     }
 
     const WAIT_ID: &str = "44444444-4444-4444-8444-444444444444";
+
+    fn obsolete_record() -> RecoveryRecord {
+        let mut record = wait_record(WAIT_ID);
+        record.phase = "needs-review".into();
+        record.wait_until = None;
+        record.wait_baselines.clear();
+        record.paused_tasks[0].pause_operation_id = WAIT_ID.into();
+        let mut planned = original_task();
+        planned.status = Some("inProgress".into());
+        planned.runtime_status = "active".into();
+        record.planned_tasks.push(planned);
+        record
+    }
+
+    #[test]
+    fn obsolete_recovery_accepts_only_confirmed_pauses_without_sent_continuation() {
+        assert!(obsolete_recovery_candidate(&obsolete_record(), "target"));
+        for changed in 0..17 {
+            let mut record = obsolete_record();
+            match changed {
+                0 => record.phase = "resume-outcome-needs-review".into(),
+                1 => record.desktop_restarted = false,
+                2 => record.runtime_identity_confirmed = false,
+                3 => record.reopened_pid = None,
+                4 => record.reopened_birth = None,
+                5 => record.reopened_port = None,
+                6 => record.wait_until = Some(1_800_000_000_000),
+                7 => record.target_provider_id = "another-provider".into(),
+                8 => record.resume_intents.push("original".into()),
+                9 => record.settings_restore_intents.push("original".into()),
+                10 => record.settings_restored_tasks.push("original".into()),
+                11 => record.resumed_tasks.push("original".into()),
+                12 => record.paused_tasks.clear(),
+                13 => record.planned_tasks.clear(),
+                14 => record.paused_tasks[0].pause_operation_id = "another-operation".into(),
+                15 => record.planned_tasks[0].context.model = Some("changed-model".into()),
+                _ => {
+                    let mut saved = serde_json::to_value(&record.paused_tasks[0]).unwrap();
+                    saved["confirmedByCcSwitch"] = json!(false);
+                    record.paused_tasks[0] = serde_json::from_value(saved).unwrap();
+                }
+            }
+            assert!(
+                !obsolete_recovery_candidate(&record, "target"),
+                "case {changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn old_recovery_is_obsolete_when_all_four_original_tasks_have_new_running_turns() {
+        let mut record = obsolete_record();
+        record.paused_tasks.clear();
+        record.planned_tasks.clear();
+        let mut inventory = TaskInventory {
+            candidate_coverage_complete: true,
+            ..Default::default()
+        };
+        for index in 0..4 {
+            let mut task = original_task();
+            task.thread_id = format!("019ed000-1111-7111-8111-{index:012}");
+            let mut saved = paused(&task);
+            saved.pause_operation_id = WAIT_ID.into();
+            record.paused_tasks.push(saved);
+            task.status = Some("inProgress".into());
+            task.runtime_status = "active".into();
+            record.planned_tasks.push(task.clone());
+            task.turn_id = Some(format!("user-new-turn-{index}"));
+            inventory.running.push(task);
+        }
+        assert!(obsolete_recovery_candidate(&record, "target"));
+        assert!(all_saved_tasks_were_changed(&record, &inventory));
+        inventory.running[3] = original_task();
+        inventory.running[3].thread_id = record.paused_tasks[3].thread_id.clone();
+        assert!(!all_saved_tasks_were_changed(&record, &inventory));
+    }
+
+    #[test]
+    fn old_recovery_terminal_proof_accepts_completed_or_explicit_user_waits() {
+        let record = obsolete_record();
+        let saved = &record.paused_tasks[0];
+        let mut completed = original_task();
+        completed.status = Some("completed".into());
+        assert!(saved_task_was_changed(saved, &completed));
+        for reason in [
+            codex_desktop_session::WaitingReason::PendingApproval,
+            codex_desktop_session::WaitingReason::PendingUserInput,
+            codex_desktop_session::WaitingReason::PendingElicitation,
+        ] {
+            let mut waiting = original_task();
+            waiting.status = Some("inProgress".into());
+            waiting.runtime_status = "active".into();
+            waiting.waiting = true;
+            waiting.waiting_reason = Some(reason);
+            assert!(saved_task_was_changed(saved, &waiting));
+        }
+    }
+
+    #[test]
+    fn old_recovery_stays_pending_for_owned_missing_unknown_or_ambiguous_tasks() {
+        let record = obsolete_record();
+        let saved = &record.paused_tasks[0];
+        assert!(!saved_task_was_changed(saved, &original_task()));
+        for changed in 0..7 {
+            let mut actual = original_task();
+            actual.turn_id = Some("new-turn".into());
+            match changed {
+                0 => actual.turn_id = None,
+                1 => actual.status = None,
+                2 => actual.runtime_status = "unknown".into(),
+                3 => actual.is_child = true,
+                4 => actual.ephemeral = true,
+                5 => {
+                    actual.waiting = true;
+                    actual.waiting_reason =
+                        Some(codex_desktop_session::WaitingReason::UnknownRuntimeFlag);
+                }
+                _ => {
+                    actual.waiting = true;
+                    actual.waiting_reason =
+                        Some(codex_desktop_session::WaitingReason::UnconfirmedTurnSubmission);
+                }
+            }
+            assert!(!saved_task_was_changed(saved, &actual), "case {changed}");
+        }
+        let missing = TaskInventory {
+            candidate_coverage_complete: true,
+            ..Default::default()
+        };
+        assert!(!all_saved_tasks_were_changed(&record, &missing));
+        let mut completed = original_task();
+        completed.status = Some("completed".into());
+        let duplicate = TaskInventory {
+            idle: vec![completed.clone(), completed],
+            candidate_coverage_complete: true,
+            ..Default::default()
+        };
+        assert!(!all_saved_tasks_were_changed(&record, &duplicate));
+    }
+
+    #[test]
+    fn obsolete_recovery_commit_preserves_saved_tickets_and_records_terminal_reason_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = obsolete_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        assert!(
+            supersede_obsolete_recovery(&path, &before, &record.paused_tasks, &|| Ok(())).unwrap()
+        );
+        let after = read_recovery_value(&path).unwrap();
+        assert_eq!(after["phase"], "superseded");
+        assert_eq!(after["pausedTasks"], before["pausedTasks"]);
+        assert_eq!(after["plannedTasks"], before["plannedTasks"]);
+        assert_eq!(after["resumeIntents"], before["resumeIntents"]);
+        assert_eq!(after["resumedTasks"], before["resumedTasks"]);
+        assert!(after["supersededReason"]
+            .as_str()
+            .unwrap()
+            .contains("未重放任何操作"));
+        assert_eq!(after["abandonedTasks"][0], record.paused_tasks[0].thread_id);
+    }
+
+    #[test]
+    fn obsolete_recovery_commit_never_overwrites_changed_or_cancelled_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = obsolete_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        let mut newer = before.clone();
+        newer["resumeIntents"] = json!(["newer-resume-intent"]);
+        std::fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
+        let newer_bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !supersede_obsolete_recovery(&path, &before, &record.paused_tasks, &|| Ok(())).unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), newer_bytes);
+        assert!(
+            supersede_obsolete_recovery(&path, &newer, &record.paused_tasks, &|| Err(
+                "synthetic cancelled generation".into()
+            ),)
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), newer_bytes);
+    }
+
+    #[test]
+    fn obsolete_recovery_commit_does_not_make_a_readable_record_oversized() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = obsolete_record();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let mut before = serde_json::to_value(&record).unwrap();
+        let padding = 1_048_576 - serde_json::to_vec(&before).unwrap().len() - 32;
+        before["unknownPreservedField"] = json!("x".repeat(padding));
+        let bytes = serde_json::to_vec(&before).unwrap();
+        assert!(bytes.len() <= 1_048_576);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(
+            supersede_obsolete_recovery(&path, &before, &record.paused_tasks, &|| Ok(()))
+                .unwrap_err()
+                .contains("读取上限")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
 
     #[test]
     fn ordinary_multi_window_instance_has_coverage_but_independent_instances_do_not() {

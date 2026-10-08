@@ -23,7 +23,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
-const REOPENED_CHAT_TIMEOUT: Duration = Duration::from_secs(30);
+const REOPENED_CHAT_TIMEOUT: Duration = Duration::from_secs(90);
 const OWNER_REFOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDED_READ_SLICE: Duration = Duration::from_millis(500);
 const MAX_CANDIDATES: usize = 5000;
@@ -575,9 +575,9 @@ impl DesktopSession {
                 "无法确认原任务由本次换号暂停；未发送恢复请求",
             ));
         }
-        self.states.remove(&paused.thread_id);
         let deadline = tokio::time::Instant::now() + REOPENED_CHAT_TIMEOUT;
         let mut next_follow = tokio::time::Instant::now();
+        let mut saw_loading = false;
         loop {
             if !guard() {
                 return Err(cancelled());
@@ -588,31 +588,44 @@ impl DesktopSession {
                 {
                     return Ok(current);
                 }
-                return Err(SessionError::new(
-                    SessionErrorKind::StateChanged,
-                    "原聊天加载后轮次、模型、权限或等待状态已改变；未发送恢复请求",
-                ));
+                let loading = reopened
+                    && self.states.get(&paused.thread_id).is_some_and(|state| {
+                        reopened_chat_is_loading(&state.metadata, &current, paused)
+                    });
+                if loading {
+                    saw_loading = true;
+                } else {
+                    return Err(SessionError::new(
+                        SessionErrorKind::StateChanged,
+                        format!(
+                            "原聊天加载后的状态已改变（{}）；未发送恢复请求",
+                            recovery_mismatch_fields(&current, paused, reopened)
+                        ),
+                    ));
+                }
             }
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Err(SessionError::new(
                     SessionErrorKind::Unknown,
-                    "新桌面未在 30 秒内加载原聊天的实时 owner；未发送恢复请求",
+                    if saw_loading {
+                        "原聊天 owner 已连接，但 90 秒内仍未完成加载；未发送恢复请求"
+                    } else {
+                        "新桌面未在 90 秒内收到原聊天的实时 owner 快照；未发送恢复请求"
+                    },
                 ));
             }
             if now >= next_follow {
-                // An earlier subscription can arrive before owner creation.
-                // Re-subscribe to obtain a snapshot once loading completes.
+                // Repeating true requests a new snapshot without removing the
+                // follower while the desktop creates/hydrates this chat's owner.
                 self.resync_needed.remove(&paused.thread_id);
-                for following in [false, true] {
+                {
                     if !guard() {
                         return Err(cancelled());
                     }
-                    let result = tokio::time::timeout_at(
-                        deadline,
-                        self.follow(&paused.thread_id, following),
-                    )
-                    .await;
+                    let result =
+                        tokio::time::timeout_at(deadline, self.follow(&paused.thread_id, true))
+                            .await;
                     if !guard() {
                         return Err(cancelled());
                     }
@@ -1405,6 +1418,76 @@ fn matches_reopened_pause(current: &TaskSnapshot, paused: &PausedTask) -> bool {
         && same_saved_project_and_model(current, paused)
 }
 
+fn reopened_chat_is_loading(metadata: &Value, current: &TaskSnapshot, paused: &PausedTask) -> bool {
+    // Approval, a real new turn and a real completion are decisions, not
+    // hydration. Missing-turn completed placeholders are desktop bootstrap data.
+    if current.waiting
+        || current.is_child
+        || current.ephemeral
+        || current.status.as_deref() == Some("inProgress")
+        || current
+            .turn_id
+            .as_deref()
+            .is_some_and(|id| id != paused.turn_id)
+        || (current.turn_id.is_some() && current.status.as_deref() == Some("completed"))
+    {
+        return false;
+    }
+    // needs_resume also survives fully hydrated snapshots and reconnects.
+    // Only missing metadata / unknown runtime is evidence of loading here.
+    if metadata["resumeState"] == "needs_resume"
+        && (current.turn_id.is_none()
+            || current.context.model.as_deref().is_none_or(str::is_empty)
+            || (paused.context.cwd.is_some() && current.context.cwd.is_none())
+            || (paused.context.model_provider.is_some()
+                && current.context.model_provider.is_none())
+            || current.runtime_status == "unknown")
+    {
+        return true;
+    }
+    current.turn_id.is_none()
+        && current.client_user_message_id.is_none()
+        && matches!(current.status.as_deref(), None | Some("completed"))
+        && matches!(current.runtime_status.as_str(), "unknown" | "notLoaded")
+}
+
+fn recovery_mismatch_fields(current: &TaskSnapshot, paused: &PausedTask, reopened: bool) -> String {
+    let mut fields = Vec::new();
+    if current.turn_id.as_deref() != Some(paused.turn_id.as_str()) {
+        fields.push("轮次");
+    }
+    if !current.matches_recovery_origin(paused) {
+        fields.push("停止原因或运行状态");
+    }
+    if current.waiting {
+        fields.push("等待审批或输入");
+    }
+    if current.is_child || current.ephemeral {
+        fields.push("聊天类型");
+    }
+    if current.context.cwd != paused.context.cwd {
+        fields.push("项目");
+    }
+    if current.context.model != paused.context.model {
+        fields.push("模型");
+    }
+    if current.context.model_provider != paused.context.model_provider {
+        fields.push("模型供应商");
+    }
+    if !(reopened && paused.saved_settings.is_some()) {
+        if current.context.thread_settings != paused.context.thread_settings {
+            fields.push("任务设置");
+        }
+        if current.context.current_permissions != paused.context.current_permissions {
+            fields.push("权限");
+        }
+    }
+    if fields.is_empty() {
+        fields.push("恢复基线");
+    }
+    fields.join("、")
+}
+
 fn save_settings_error() -> SessionError {
     SessionError::new(
         SessionErrorKind::Blocked,
@@ -1768,6 +1851,7 @@ fn project_at(path: &[String], value: &Value) -> Option<Value> {
         | "latestReasoningEffort"
         | "latestCollaborationMode"
         | "modelProvider"
+        | "resumeState"
         | "agentNickname"
         | "threadSource"
         | "ephemeral"
@@ -3032,6 +3116,10 @@ mod tests {
             while let Some(message) = read_frame(&mut server).await {
                 let method = message["method"].as_str().unwrap_or("");
                 methods.push(method.to_owned());
+                assert_eq!(
+                    message["params"]["following"], true,
+                    "owner loading must not remove its follower"
+                );
                 if method == "thread-stream-following-changed"
                     && message["params"]["following"] == true
                 {
@@ -3075,7 +3163,7 @@ mod tests {
         drop(session);
         let methods = owner.await.unwrap();
         assert!(
-            methods.len() >= 8,
+            methods.len() >= 5,
             "owner needs subscriptions after loading"
         );
         assert!(methods
@@ -3105,10 +3193,7 @@ mod tests {
         drop(session);
         assert_eq!(
             owner.await.unwrap(),
-            vec![
-                "thread-stream-following-changed",
-                "thread-stream-following-changed"
-            ]
+            vec!["thread-stream-following-changed"]
         );
 
         let (mut session, owner) = subscription_owner(state("interrupted"), Duration::ZERO, None);
@@ -3157,6 +3242,103 @@ mod tests {
                 .iter()
                 .all(|method| method == "thread-stream-following-changed"));
         }
+    }
+
+    #[tokio::test]
+    async fn reopened_wait_keeps_an_already_received_owner_snapshot() {
+        let mut session = fake_session();
+        let mut hydrated = state("interrupted");
+        hydrated["resumeState"] = json!("needs_resume");
+        session
+            .ingest(&json!({"type":"broadcast","sourceClientId":"new-owner",
+            "method":"thread-stream-state-changed","version":11,
+            "params":{"hostId":"local","conversationId":THREAD,
+                "change":{"type":"snapshot","revision":1,
+                    "conversationState":hydrated}}}))
+            .unwrap();
+        let observed = session
+            .wait_for_reopened_paused_chat(&paused(), || true)
+            .await
+            .unwrap();
+        assert!(observed.matches_paused(&paused()));
+        assert_eq!(observed.owner, "new-owner");
+        assert!(session.mutation_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopened_wait_accepts_hydration_after_a_completed_placeholder() {
+        let (mut session, owner) =
+            subscription_owner(state("interrupted"), Duration::from_millis(1200), None);
+        let placeholder = json!({"id":THREAD,"resumeState":"needs_resume",
+            "threadRuntimeStatus":{"type":"notLoaded"},
+            "turns":[{"turnId":null,"status":"completed"}]});
+        session
+            .ingest(&json!({"type":"broadcast","sourceClientId":"new-owner",
+            "method":"thread-stream-state-changed","version":11,
+            "params":{"hostId":"local","conversationId":THREAD,
+                "change":{"type":"snapshot","revision":1,
+                    "conversationState":placeholder}}}))
+            .unwrap();
+        let observed = session
+            .wait_for_reopened_paused_chat(&paused(), || true)
+            .await
+            .unwrap();
+        assert!(observed.matches_paused(&paused()));
+        assert!(session.mutation_attempts.is_empty());
+        drop(session);
+        assert!(owner.await.unwrap().len() >= 3);
+    }
+
+    #[test]
+    fn hydration_flag_never_masks_approval_completion_or_a_new_turn() {
+        let ticket = paused();
+        let mut loading = json!({"id":THREAD,"resumeState":"needs_resume",
+            "turns":[{"turnId":null,"status":"completed"}],
+            "threadRuntimeStatus":{"type":"notLoaded"}});
+        let metadata = project_at(&[], &loading).unwrap();
+        assert_eq!(metadata["resumeState"], "needs_resume");
+        assert!(reopened_chat_is_loading(
+            &metadata,
+            &summarize(&metadata, "owner").unwrap(),
+            &ticket
+        ));
+        for status in ["completed", "inProgress"] {
+            let mut changed = state(status);
+            changed["resumeState"] = json!("needs_resume");
+            let metadata = project_at(&[], &changed).unwrap();
+            assert!(!reopened_chat_is_loading(
+                &metadata,
+                &summarize(&metadata, "owner").unwrap(),
+                &ticket
+            ));
+        }
+        loading["requests"] = json!([{"method":"item/commandExecution/requestApproval"}]);
+        let metadata = project_at(&[], &loading).unwrap();
+        assert!(!reopened_chat_is_loading(
+            &metadata,
+            &summarize(&metadata, "owner").unwrap(),
+            &ticket
+        ));
+        let mut changed = state("interrupted");
+        changed["resumeState"] = json!("needs_resume");
+        changed["turns"][0]["turnId"] = json!("manual-new-turn");
+        let metadata = project_at(&[], &changed).unwrap();
+        assert!(!reopened_chat_is_loading(
+            &metadata,
+            &summarize(&metadata, "owner").unwrap(),
+            &ticket
+        ));
+    }
+
+    #[test]
+    fn mismatch_diagnostics_identify_fields_without_private_values() {
+        let mut changed = summarize(&projected("completed"), "owner").unwrap();
+        changed.context.model = Some("private-model-name".into());
+        changed.context.cwd = Some("private-project-path".into());
+        let detail = recovery_mismatch_fields(&changed, &paused(), true);
+        assert!(detail.contains("停止原因或运行状态"));
+        assert!(detail.contains("项目") && detail.contains("模型"));
+        assert!(!detail.contains("private") && !detail.contains(THREAD));
     }
 
     fn saved_paused() -> PausedTask {

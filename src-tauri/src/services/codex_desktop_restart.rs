@@ -12,6 +12,153 @@ use std::sync::{Arc, LazyLock, Mutex};
 static RESTART_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
+/// A timed-out Restart Manager call cannot be terminated safely. Its only
+/// remaining authority is the already registered normal shutdown request.
+/// Retain this lease until both shutdown and cancellation have returned, so
+/// neither a timer nor a manual restart can replay that request meanwhile.
+#[derive(Default)]
+struct ShutdownGate {
+    active: std::sync::atomic::AtomicBool,
+}
+
+struct ShutdownLease {
+    gate: Arc<ShutdownGate>,
+}
+
+impl Drop for ShutdownLease {
+    fn drop(&mut self) {
+        self.gate
+            .active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl ShutdownGate {
+    fn ensure_idle(&self) -> Result<(), String> {
+        if self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(
+                "上一条 Codex 正常退出请求仍待 Windows 确认；未排队或重复关闭桌面，请稍后核对"
+                    .into(),
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<Arc<ShutdownLease>, String> {
+        self.active
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .map_err(|_| "上一条 Codex 正常退出请求尚未完成；未重复关闭桌面".to_string())?;
+        Ok(Arc::new(ShutdownLease { gate: self.clone() }))
+    }
+}
+
+static SHUTDOWN_GATE: LazyLock<Arc<ShutdownGate>> =
+    LazyLock::new(|| Arc::new(ShutdownGate::default()));
+
+/// Call before pausing tasks as well as before entering the restart runtime.
+pub fn ensure_no_shutdown_pending() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    native::reconcile_unobserved_quit();
+    SHUTDOWN_GATE.ensure_idle()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn abandon_shutdown<Cancel>(cancel: Cancel, lease: Arc<ShutdownLease>, reason: &str) -> String
+where
+    Cancel: FnOnce() -> u32 + Send + 'static,
+{
+    log::warn!("Codex 正常退出等待已停止：{reason}；请求取消 Windows 正常退出，结果仍待核对");
+    // RmCancelCurrentTask can itself wait. It must never extend the caller's
+    // deadline or own account activation / desktop launch / task recovery.
+    let spawned = std::thread::Builder::new()
+        .name("codex-normal-shutdown-cancel".into())
+        .spawn(move || {
+            let _lease = lease;
+            log::info!("Codex Windows 正常退出取消请求开始");
+            let result = cancel();
+            log::info!("Codex Windows 正常退出取消请求返回（Windows {result}）；不代表退出已取消");
+        });
+    if spawned.is_ok() {
+        format!("{reason}；已请求取消，退出结果仍需核对；未修改登录、重启或继续")
+    } else {
+        format!("{reason}；取消请求线程无法启动，退出结果仍需核对；未修改登录、重启或继续")
+    }
+}
+
+/// Only `shutdown` and `cancel` cross into detached threads. In particular,
+/// no late successful return can run the caller's after-exit action. Dropping
+/// the waiter invalidates the operation while the lease guards against replay.
+#[cfg(any(target_os = "windows", test))]
+fn bounded_normal_shutdown<Shutdown, Cancel>(
+    gate: Arc<ShutdownGate>,
+    shutdown: Shutdown,
+    cancel: Cancel,
+    guard: &dyn Fn() -> Result<(), String>,
+    timeout: std::time::Duration,
+    guard_interval: std::time::Duration,
+) -> Result<u32, String>
+where
+    Shutdown: FnOnce() -> u32 + Send + 'static,
+    Cancel: FnOnce() -> u32 + Send + 'static,
+{
+    guard()?;
+    let lease = gate.acquire()?;
+    let worker_lease = lease.clone();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("codex-normal-shutdown".into())
+        .spawn(move || {
+            let _lease = worker_lease;
+            let started = std::time::Instant::now();
+            log::info!("Codex Windows 正常退出调用开始（不强制结束）");
+            let result = shutdown();
+            log::info!(
+                "Codex Windows 正常退出调用返回（Windows {result}，耗时 {} 毫秒）",
+                started.elapsed().as_millis()
+            );
+            let _ = sender.send(result);
+        })
+        .map_err(|_| "无法启动 Codex 正常退出协调线程；未关闭桌面、未修改登录".to_string())?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Err(reason) = guard() {
+            return Err(abandon_shutdown(cancel, lease, &reason));
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            let duration = if timeout.as_secs() > 0 {
+                format!("{} 秒", timeout.as_secs())
+            } else {
+                format!("{} 毫秒", timeout.as_millis())
+            };
+            return Err(abandon_shutdown(
+                cancel,
+                lease,
+                &format!("Codex 正常退出调用超过 {duration} 未返回"),
+            ));
+        }
+        match receiver.recv_timeout((deadline - now).min(guard_interval)) {
+            Ok(result) => {
+                guard()?;
+                return Ok(result);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(
+                    "Codex 正常退出协调线程意外结束；退出结果仍需核对，未修改登录、重启或继续"
+                        .into(),
+                );
+            }
+        }
+    }
+}
+
 /// An activation receipt belongs only to the fresh package process created by
 /// this operation. The reader checks process birth and listener ownership again.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,7 +366,11 @@ pub async fn restart_bound(
     before_shutdown: Box<dyn FnOnce() -> Result<(), String> + Send>,
     manual: bool,
 ) -> Result<bool, String> {
-    let _lock = RESTART_LOCK.lock().await;
+    ensure_no_shutdown_pending()?;
+    let _lock = RESTART_LOCK
+        .try_lock()
+        .map_err(|_| "另一条 Codex 桌面重开流程仍在处理；本次未排队、未重复关闭桌面".to_string())?;
+    ensure_no_shutdown_pending()?;
     *IDENTITY_RECEIPT
         .lock()
         .map_err(|_| "无法核对本次桌面启动记录")? = None;
@@ -234,6 +385,7 @@ pub async fn restart_bound(
             let mut runtime = BoundRuntime {
                 inner: native::WindowsRuntime {
                     before_shutdown: Some(before_shutdown),
+                    quit_guard: guard.clone(),
                 },
                 expected,
             };
@@ -501,6 +653,7 @@ mod native {
     };
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use windows_sys::core::GUID;
     use windows_sys::Win32::Foundation::{
@@ -521,8 +674,8 @@ mod native {
     };
     use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows_sys::Win32::System::RestartManager::{
-        RmEndSession, RmGetList, RmRegisterResources, RmShutdown, RmStartSession, RM_PROCESS_INFO,
-        RM_UNIQUE_PROCESS,
+        RmCancelCurrentTask, RmEndSession, RmGetList, RmRegisterResources, RmShutdown,
+        RmStartSession, RM_PROCESS_INFO, RM_UNIQUE_PROCESS,
     };
     use windows_sys::Win32::System::StationsAndDesktops::{
         CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS, UOI_NAME,
@@ -535,6 +688,7 @@ mod native {
 
     pub(super) struct WindowsRuntime {
         pub(super) before_shutdown: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
+        pub(super) quit_guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     }
     // Only an explicit new manual activation may consume this marker. It
     // contains no auth, task, or old operation data, and is never a timer job.
@@ -860,6 +1014,57 @@ mod native {
 
     const NORMAL_SHUTDOWN_FLAGS: u32 = 0;
 
+    // Windows kernel handles can be waited on from another thread. This
+    // wrapper owns one validated process object and only exposes a wait;
+    // Arc keeps it alive until every observer has finished, with one CloseHandle.
+    struct QuitObserverHandle(Handle);
+    unsafe impl Send for QuitObserverHandle {}
+    unsafe impl Sync for QuitObserverHandle {}
+    impl QuitObserverHandle {
+        fn exited(&self) -> bool {
+            unsafe { WaitForSingleObject(self.0 .0, 0) == 0 }
+        }
+    }
+    type UnobservedQuit = (Arc<super::ShutdownLease>, Arc<QuitObserverHandle>);
+    static UNOBSERVED_QUIT: std::sync::Mutex<Option<UnobservedQuit>> = std::sync::Mutex::new(None);
+
+    pub(super) fn reconcile_unobserved_quit() {
+        let mut pending = UNOBSERVED_QUIT.lock().unwrap_or_else(|p| p.into_inner());
+        if pending.as_ref().is_some_and(|(_, handle)| handle.exited()) {
+            pending.take();
+        }
+    }
+
+    fn retain_quit_gate_until_original_exit(
+        lease: Arc<super::ShutdownLease>,
+        handle: Arc<QuitObserverHandle>,
+    ) -> Result<(), String> {
+        let observer_lease = lease.clone();
+        let observer_handle = handle.clone();
+        let spawned = std::thread::Builder::new()
+            .name("codex-normal-quit-observer".into())
+            .spawn(move || {
+                let _lease = observer_lease;
+                loop {
+                    if observer_handle.exited() {
+                        log::info!("Codex 原生退出请求所绑定的原进程已退出；解除防重放保护");
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            });
+        if spawned.is_err() {
+            // Keep the gate, with its kernel object available for a later
+            // read-only check. Never treat an observer failure as confirmed exit.
+            *UNOBSERVED_QUIT.lock().unwrap_or_else(|p| p.into_inner()) = Some((lease, handle));
+            return Err(
+                "原生退出请求已发送，但退出观察器无法启动；结果待核对，未重复关闭或执行后续流程"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     impl RestartRuntime for WindowsRuntime {
         fn pending_closed_desktop(&mut self) -> Option<Desktop> {
             PENDING_CLOSED_DESKTOP
@@ -888,6 +1093,8 @@ mod native {
             desktops: &[Desktop],
             guard: &dyn Fn() -> Result<(), String>,
         ) -> Result<(), String> {
+            super::ensure_no_shutdown_pending()?;
+            log::info!("Codex 正常退出准备：核对桌面进程及 Windows 退出资源");
             validate_restart_roots(desktops)?;
             if desktops.is_empty() || self::desktops()? != desktops {
                 return Err("原 Codex 桌面进程清单已变化；本次不会关闭其他进程".into());
@@ -908,7 +1115,10 @@ mod native {
                 if result != 0 {
                     return Err(format!("无法发起 Codex 正常退出（Windows {result}）"));
                 }
-                let session = RestartSession(session);
+                // Cancellation can still be running after the controller has
+                // returned. EndSession belongs to the last holder, never to
+                // the timed-out caller alone.
+                let session = Arc::new(RestartSession(session));
                 let registered: Vec<_> = desktops
                     .iter()
                     .map(|desktop| RM_UNIQUE_PROCESS {
@@ -957,9 +1167,21 @@ mod native {
                 if !same_process_set(&expected, &actual) {
                     return Err("正常退出清单出现了其他进程；本次不关闭桌面".into());
                 }
+                let prepared_quit = if desktops.len() == 1 {
+                    tauri::async_runtime::block_on(
+                        crate::services::codex_desktop_quit::prepare_normal_quit(
+                            desktops[0].pid,
+                            desktops[0].birth,
+                            self.quit_guard.as_ref(),
+                        ),
+                    )?
+                } else {
+                    None
+                };
                 // Do not use RmForceShutdown or TerminateProcess. This asks
                 // Electron to process its ordinary end-session cleanup.
                 if let Some(check_tasks) = self.before_shutdown.take() {
+                    log::info!("Codex 正常退出准备：正在最后核对已保存任务");
                     check_tasks()?;
                 }
                 guard()?;
@@ -975,9 +1197,60 @@ mod native {
                 }
                 let app_servers = app_server_handles(&tree)?;
                 guard()?;
-                let result = RmShutdown(session.0, NORMAL_SHUTDOWN_FLAGS, None);
                 let deadline = Instant::now() + Duration::from_secs(15);
+                let quit_handle = if prepared_quit.is_some() {
+                    Some(Arc::new(QuitObserverHandle(exact_process_handle(
+                        &desktops[0],
+                    )?)))
+                } else {
+                    None
+                };
+                let quit_lease = prepared_quit
+                    .as_ref()
+                    .map(|_| super::SHUTDOWN_GATE.acquire())
+                    .transpose()?;
+                let quit_request = if let Some(prepared) = prepared_quit {
+                    tauri::async_runtime::block_on(
+                        crate::services::codex_desktop_quit::send_prepared_quit(
+                            prepared,
+                            self.quit_guard.as_ref(),
+                        ),
+                    )?
+                } else {
+                    crate::services::codex_desktop_quit::QuitRequest::Unavailable
+                };
+                let result = match quit_request {
+                    crate::services::codex_desktop_quit::QuitRequest::Sent => {
+                        retain_quit_gate_until_original_exit(
+                            quit_lease.ok_or("原生退出请求缺少本次防重放保护")?,
+                            quit_handle.ok_or("原生退出请求缺少本次原进程核验对象")?,
+                        )?;
+                        log::info!("Codex 原生退出应用请求已发送，正在核对进程退出；不追加 Windows 关闭请求");
+                        0
+                    }
+                    crate::services::codex_desktop_quit::QuitRequest::Unavailable => {
+                        drop(quit_lease);
+                        guard()?;
+                        let shutdown_session = session.clone();
+                        let cancel_session = session.clone();
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            return Err(
+                                "Codex 正常退出准备超过 15 秒；未发送 Windows 关闭请求".into()
+                            );
+                        }
+                        super::bounded_normal_shutdown(
+                            super::SHUTDOWN_GATE.clone(),
+                            move || RmShutdown(shutdown_session.0, NORMAL_SHUTDOWN_FLAGS, None),
+                            move || RmCancelCurrentTask(cancel_session.0),
+                            guard,
+                            remaining,
+                            Duration::from_millis(100),
+                        )?
+                    }
+                };
                 while Instant::now() < deadline {
+                    guard()?;
                     let mut roots_exited = true;
                     for handle in &handles {
                         match WaitForSingleObject(handle.0, 0) {
@@ -997,6 +1270,7 @@ mod native {
                     }
                     if roots_exited {
                         if remaining.is_empty() && app_servers_exited(&app_servers)? {
+                            log::info!("Codex 原桌面及原后台退出已确认");
                             return Ok(());
                         }
                         // The old renderer/GPU children may finish cleanup
@@ -1288,6 +1562,207 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::rc::Rc;
+
+    fn await_shutdown_gate_idle(gate: &ShutdownGate) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while gate.ensure_idle().is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            gate.ensure_idle().is_ok(),
+            "synthetic shutdown workers must finish"
+        );
+    }
+
+    #[test]
+    fn normal_shutdown_worker_success_is_observed_once_without_cancellation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let gate = Arc::new(ShutdownGate::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let shutdown_calls = calls.clone();
+        assert_eq!(
+            bounded_normal_shutdown(
+                gate.clone(),
+                move || {
+                    shutdown_calls.fetch_add(1, Ordering::SeqCst);
+                    0
+                },
+                || panic!("a confirmed shutdown must not be cancelled"),
+                &|| Ok(()),
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        await_shutdown_gate_idle(&gate);
+    }
+
+    struct BlockedShutdownRuntime {
+        gate: Arc<ShutdownGate>,
+        release: Option<std::sync::mpsc::Receiver<()>>,
+        cancelled: Arc<std::sync::atomic::AtomicUsize>,
+        activations: usize,
+    }
+
+    impl RestartRuntime for BlockedShutdownRuntime {
+        fn running_desktops(&mut self) -> Result<Vec<Desktop>, String> {
+            Ok(vec![synthetic_desktop(10, 20)])
+        }
+
+        fn close_and_confirm(
+            &mut self,
+            _: &[Desktop],
+            guard: &dyn Fn() -> Result<(), String>,
+        ) -> Result<(), String> {
+            let release = self.release.take().unwrap();
+            let cancelled = self.cancelled.clone();
+            bounded_normal_shutdown(
+                self.gate.clone(),
+                move || {
+                    release.recv().unwrap();
+                    0
+                },
+                move || {
+                    cancelled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    0
+                },
+                guard,
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(1),
+            )?;
+            Ok(())
+        }
+
+        fn activate_and_confirm(
+            &mut self,
+            _: &Desktop,
+            _: &dyn Fn() -> Result<(), String>,
+        ) -> Result<(), String> {
+            self.activations += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn blocked_shutdown_times_out_and_late_success_never_enables_or_activates() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let gate = Arc::new(ShutdownGate::default());
+        let (release, waiting) = std::sync::mpsc::channel();
+        let cancelled = Arc::new(AtomicUsize::new(0));
+        let enabled = Cell::new(0);
+        let mut runtime = BlockedShutdownRuntime {
+            gate: gate.clone(),
+            release: Some(waiting),
+            cancelled: cancelled.clone(),
+            activations: 0,
+        };
+        let started = Instant::now();
+        let error = restart_with_action(&mut runtime, &|| Ok(()), || {
+            enabled.set(enabled.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(error.contains("超过 10 毫秒"));
+        assert!(error.contains("退出结果仍需核对"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            gate.ensure_idle().is_err(),
+            "late RM call still owns its lease"
+        );
+        assert!(gate.acquire().is_err(), "a second shutdown must not queue");
+        release.send(()).unwrap();
+        await_shutdown_gate_idle(&gate);
+        assert_eq!(cancelled.load(Ordering::SeqCst), 1);
+        assert_eq!(enabled.get(), 0);
+        assert_eq!(runtime.activations, 0);
+    }
+
+    #[test]
+    fn shutdown_guard_cancellation_returns_before_the_blocked_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let gate = Arc::new(ShutdownGate::default());
+        let (release, waiting) = std::sync::mpsc::channel();
+        let checks = Cell::new(0);
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cancel_calls = cancellations.clone();
+        let started = Instant::now();
+        let error = bounded_normal_shutdown(
+            gate.clone(),
+            move || {
+                waiting.recv().unwrap();
+                0
+            },
+            move || {
+                cancel_calls.fetch_add(1, Ordering::SeqCst);
+                0
+            },
+            &|| {
+                checks.set(checks.get() + 1);
+                if checks.get() >= 3 {
+                    Err("用户已取消或选择了另一个账号".into())
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+        assert!(error.contains("用户已取消"));
+        assert!(error.contains("已请求取消，退出结果仍需核对"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(gate.ensure_idle().is_err());
+        release.send(()).unwrap();
+        await_shutdown_gate_idle(&gate);
+        assert_eq!(cancellations.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blocked_cancellation_also_keeps_the_shutdown_gate_until_both_workers_finish() {
+        use std::time::{Duration, Instant};
+        let gate = Arc::new(ShutdownGate::default());
+        let (release_shutdown, shutdown_waiting) = std::sync::mpsc::channel();
+        let (shutdown_finished, finished) = std::sync::mpsc::channel();
+        let (cancel_started, cancelling) = std::sync::mpsc::channel();
+        let (release_cancel, cancel_waiting) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        assert!(bounded_normal_shutdown(
+            gate.clone(),
+            move || {
+                shutdown_waiting.recv().unwrap();
+                shutdown_finished.send(()).unwrap();
+                0
+            },
+            move || {
+                cancel_started.send(()).unwrap();
+                cancel_waiting.recv().unwrap();
+                0
+            },
+            &|| Ok(()),
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+        )
+        .is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        cancelling.recv_timeout(Duration::from_secs(1)).unwrap();
+        release_shutdown.send(()).unwrap();
+        finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            gate.ensure_idle().is_err(),
+            "pending cancellation retains the session"
+        );
+        release_cancel.send(()).unwrap();
+        await_shutdown_gate_idle(&gate);
+        assert!(
+            gate.acquire().is_ok(),
+            "a completed operation releases the gate"
+        );
+    }
 
     #[test]
     fn navigation_waits_for_late_single_instance_handoff_without_ignoring_extra_desktops() {

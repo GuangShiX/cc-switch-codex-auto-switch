@@ -3,6 +3,7 @@ pub mod codex_auto_switch;
 pub mod codex_switch_history;
 pub mod codex_desktop_bridge;
 pub(crate) mod codex_desktop_identity;
+pub(crate) mod codex_desktop_quit;
 pub(crate) mod codex_desktop_restart;
 pub(crate) mod codex_desktop_session;
 pub mod codex_oauth_models;
