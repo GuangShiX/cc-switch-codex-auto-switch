@@ -60,6 +60,8 @@ Gemini 的可选令牌刷新需要在构建时提供 `CC_SWITCH_GEMINI_OAUTH_CLI
 
 Windows PowerShell 操作使用 PowerShell 7。此分支已关闭上游自动更新通道；更新源码或后续下载应使用本仓库，避免被上游发行包覆盖。
 
+Windows 下 Debug 和 Release 程序均不弹出控制台窗口，日志仍写入本地配置目录的 `logs/cc-switch.log`。设置中的“静默启动”可让主界面直接隐藏到托盘，后台监测照常运行。
+
 ## 账号及隐私
 
 账号仍由 CC Switch 现有本地托管账号与供应商服务管理；本改造不清空数据库、不要求逐个重新登录，也不依赖旧自动换号插件或模型调用切号工具。
