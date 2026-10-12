@@ -46,7 +46,7 @@ describe("Codex OAuth quota card", () => {
     expect(screen.queryByText("Pro · 无5小时窗口")).not.toBeInTheDocument();
   });
 
-  it("loads inactive managed cards initially without enabling their polling", () => {
+  it("displays inactive managed cards without automatic queries", () => {
     quotaHook.mockReturnValue({
       data: undefined,
       isFetching: false,
@@ -56,13 +56,12 @@ describe("Codex OAuth quota card", () => {
     render(<CodexOauthQuotaFooter isCurrent={false} />);
 
     expect(quotaHook).toHaveBeenCalledWith(undefined, {
-      enabled: true,
+      enabled: false,
       autoQuery: false,
-      autoQueryIntervalMinutes: 5,
     });
   });
 
-  it("keeps the active card's existing five minute query", () => {
+  it("leaves current-account monitoring to the native service", () => {
     quotaHook.mockReturnValue({
       data: undefined,
       isFetching: false,
@@ -72,9 +71,8 @@ describe("Codex OAuth quota card", () => {
     render(<CodexOauthQuotaFooter isCurrent autoQueryInterval={5} />);
 
     expect(quotaHook).toHaveBeenCalledWith(undefined, {
-      enabled: true,
-      autoQuery: true,
-      autoQueryIntervalMinutes: 5,
+      enabled: false,
+      autoQuery: false,
     });
   });
 

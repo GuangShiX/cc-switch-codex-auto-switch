@@ -1,5 +1,6 @@
 import React from "react";
-import { Loader2 } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useCodexOauthQuotaByAccountId } from "@/lib/query/subscription";
 import { SubscriptionQuotaView } from "@/components/SubscriptionQuotaFooter";
 
@@ -15,18 +16,19 @@ interface CodexOauthAccountQuotaProps {
  * `SubscriptionQuotaView` 的展开布局（进度条 + 重置倒计时 + 刷新按钮），
  * 因此与供应商卡片里的额度展示保持完全一致的观感与状态处理。
  *
- * 面板打开时缺少缓存或缓存超过 30 分钟才查询，不轮询；与供应商卡片
- * 共用账号缓存，用户可点卡片内的刷新按钮立即手动更新。
+ * 与供应商卡片共用后台查询结果；打开面板不额外查询账号，用户可点
+ * 刷新按钮立即手动更新，与自动换号开关无关。
  */
 const CodexOauthAccountQuota: React.FC<CodexOauthAccountQuotaProps> = ({
   accountId,
 }) => {
+  const { t } = useTranslation();
   const {
     data: quota,
     isFetching: loading,
     refetch,
   } = useCodexOauthQuotaByAccountId(accountId, {
-    enabled: true,
+    enabled: false,
     autoQuery: false,
   });
 
@@ -39,6 +41,19 @@ const CodexOauthAccountQuota: React.FC<CodexOauthAccountQuotaProps> = ({
       <div className="mt-3 flex items-center justify-center rounded-xl border border-border-default bg-card py-5 shadow-sm">
         <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
       </div>
+    );
+  }
+
+  if (!quota) {
+    return (
+      <button
+        type="button"
+        onClick={() => void refetch()}
+        className="mt-3 inline-flex items-center gap-1.5 rounded p-1 text-xs text-muted-foreground hover:bg-muted"
+      >
+        <RefreshCw size={12} />
+        {t("subscription.refresh")}
+      </button>
     );
   }
 

@@ -22,8 +22,6 @@ interface CodexOauthQuotaFooterProps {
 const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
   meta,
   inline = false,
-  isCurrent = false,
-  autoQueryInterval = 5,
 }) => {
   const { t } = useTranslation();
   const {
@@ -31,15 +29,14 @@ const CodexOauthQuotaFooter: React.FC<CodexOauthQuotaFooterProps> = ({
     isFetching: loading,
     refetch,
   } = useCodexOauthQuota(meta, {
-    // Every account loads its initial quota; only the current account polls.
-    // Inactive accounts reuse cached/native results for thirty minutes,
-    // including when cards are remounted during navigation.
-    enabled: true,
-    autoQuery: isCurrent && autoQueryInterval > 0,
-    autoQueryIntervalMinutes: autoQueryInterval,
+    // The native monitor owns the five-minute current-account query and only
+    // checks other accounts when switching. Cards display its cached events;
+    // explicit refetch still works while automatic queries are disabled.
+    enabled: false,
+    autoQuery: false,
   });
 
-  if (!isCurrent && !quota) {
+  if (!quota) {
     return (
       <button
         type="button"

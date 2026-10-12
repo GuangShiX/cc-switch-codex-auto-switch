@@ -60,6 +60,7 @@ jobs:
           tests/components/CodexAutoSwitchApi.test.ts
           tests/components/CodexAutoSwitchPanel.test.tsx
           tests/components/CodexOauthQuotaFooter.test.tsx
+          tests/components/CodexOauthQuotaFooter.nativeCache.test.tsx
           tests/components/ProviderActions.test.tsx
           tests/hooks/useProviderActions.test.tsx
           tests/hooks/useDragSort.test.tsx

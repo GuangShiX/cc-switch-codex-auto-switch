@@ -125,6 +125,16 @@ Codex 主页移除自动换号面板，右上角新增与 Skills 管理同级的
 
 安装只正常退出并重开 CC Switch，当前 Codex 进程及出生时间保持一致。供应商与托管账号数量、绑定和排序、当前选择、自动开关、Codex 登录配置以及已有失败和恢复记录保持一致，SQLite 检查正常。运行期间 OAuth 存储中两个账号的刷新令牌、身份令牌及更新时间发生更新，没有将旧令牌备份写回。此项验证仅证明无控制台启动，不包含完整桌面换号与恢复复测。
 
+### 简化后台查询及停用会话自动统计
+
+2026-10-12 按使用需求将本地会话 Token／费用统计默认改为手动模式，关闭时启动及周期任务均不扫描日志或回填统计；手动同步入口保留。额度监测及聊天恢复使用独立服务，没有修改原任务恢复判断。账号卡片及认证中心改为只展示后台事件与缓存，手动刷新照常；托盘悬停也不额外查询托管 Codex 额度。五分钟后台监测及需要换号时的候选核验保持原实现。
+
+相关前端 5 个文件、33 项测试通过，覆盖挂载、聚焦、重连、35 分钟等待及重新挂载均不自动请求、后台事件填充、手动刷新；设置相关原生 12 项及托盘 36 项通过，TypeScript、前端及 Windows 构建通过。源码 1272 个文件及构建后的前端字体检查无发现。
+
+本机已安装，并将现有会话自动统计开关关闭，其它设置字段一致。安装核对确认账号数量、选择、绑定及排序、登录配置、OAuth 存储、失败及恢复记录保持一致，SQLite 正常，当前 Codex 进程及出生时间不变。安装前 16.3 秒样本约占一个逻辑核心的 99.5%，进程读取 59.6 MB/s；安装后连续 72.3 秒样本平均为同口径 0.065% 和 6.5 KB/s，跨过旧统计任务的一分钟周期。此为本机短期负载验证，不代表物理磁盘吞吐或长期稳定性；未额外触发真实切号及任务恢复。
+
+启动约五分钟后已观察到自然额度检查，后台完成后回到 monitoring；会话自动统计保持关闭，Codex 进程保持运行。本次当前账号可用，没有执行换号或恢复任务。
+
 ## 尚未真实验证
 
 以下场景尚未逐项进行真实桌面测试：
@@ -146,7 +156,7 @@ Codex 主页移除自动换号面板，右上角新增与 Skills 管理同级的
 ```sh
 pnpm install --frozen-lockfile
 pnpm typecheck
-pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/hooks/useUsageCacheBridge.test.tsx tests/lib/forkUpdater.test.ts tests/integration/App.test.tsx
+pnpm exec vitest run tests/components/CodexAutoSwitchApi.test.ts tests/components/CodexAutoSwitchPanel.test.tsx tests/components/CodexOauthQuotaFooter.test.tsx tests/components/CodexOauthQuotaFooter.nativeCache.test.tsx tests/components/ProviderActions.test.tsx tests/hooks/useProviderActions.test.tsx tests/hooks/useDragSort.test.tsx tests/hooks/useUsageCacheBridge.test.tsx tests/lib/forkUpdater.test.ts tests/integration/App.test.tsx
 pnpm build:renderer
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib services::codex_
 cargo test --locked --manifest-path src-tauri/Cargo.toml --lib codex_oauth_auth

@@ -96,7 +96,7 @@ interface UsageDashboardProps {
 export function UsageDashboard({
   refreshIntervalMs: savedRefreshIntervalMs,
   onRefreshIntervalChange,
-  sessionAutoSyncEnabled = true,
+  sessionAutoSyncEnabled = false,
   onSessionAutoSyncEnabledChange,
 }: UsageDashboardProps = {}) {
   const { t, i18n } = useTranslation();

@@ -379,7 +379,7 @@ pub struct AppSettings {
     pub usage_confirmed: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_dashboard_refresh_interval_ms: Option<u32>,
-    /// 会话用量自动扫描开关（默认开启=自动模式）。关闭后停止后台定时扫描
+    /// 会话用量自动扫描开关（默认关闭=手动模式）。关闭后停止后台定时扫描
     /// 各客户端会话日志，仅在用户点击"立即同步"时手动扫描；只管扫描时机，
     /// 代理接管记账与启动费用回填（不读会话文件）不受此开关影响。
     #[serde(default = "default_session_auto_sync_enabled")]
@@ -518,7 +518,7 @@ fn default_show_profile_switcher() -> bool {
 }
 
 fn default_session_auto_sync_enabled() -> bool {
-    true
+    false
 }
 
 impl Default for AppSettings {
@@ -535,7 +535,7 @@ impl Default for AppSettings {
             proxy_confirmed: None,
             usage_confirmed: None,
             usage_dashboard_refresh_interval_ms: None,
-            session_auto_sync_enabled: true,
+            session_auto_sync_enabled: false,
             enable_failover_toggle: false,
             show_profile_switcher: true,
             preserve_codex_official_auth_on_switch: false,

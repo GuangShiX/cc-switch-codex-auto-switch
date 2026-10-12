@@ -1279,15 +1279,18 @@ pub fn run() {
                     const SESSION_SYNC_INTERVAL_SECS: u64 = 60;
 
                     async fn run_session_sync(db: std::sync::Arc<crate::database::Database>, backfill: bool) {
-                        // 手动扫描模式下跳过定时扫描；backfill 轮（启动首轮）仍进入，
-                        // 费用回填只修补数据库既有行（含代理记账行），不读会话文件
-                        if !backfill && !crate::settings::get_settings().session_auto_sync_enabled {
+                        // 手动模式下启动和定时任务均不扫描会话或回填统计。
+                        // Codex 额度监测及桌面任务恢复使用独立的后台服务。
+                        if !crate::settings::get_settings().session_auto_sync_enabled {
                             return;
                         }
                         let _guard = crate::services::session_usage::session_sync_mutex()
                             .lock()
                             .await;
                         let task = tauri::async_runtime::spawn_blocking(move || {
+                            if !crate::settings::get_settings().session_auto_sync_enabled {
+                                return crate::services::session_usage::SessionSyncResult::default();
+                            }
                             if backfill {
                                 if let Err(error) = db.backfill_missing_usage_costs() {
                                     log::warn!("Usage cost startup backfill failed: {error}");

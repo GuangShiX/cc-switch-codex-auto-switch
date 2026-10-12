@@ -517,7 +517,7 @@ export function SettingsPage({
                     handleAutoSave({ usageDashboardRefreshIntervalMs })
                   }
                   sessionAutoSyncEnabled={
-                    settings?.sessionAutoSyncEnabled ?? true
+                    settings?.sessionAutoSyncEnabled ?? false
                   }
                   onSessionAutoSyncEnabledChange={(sessionAutoSyncEnabled) =>
                     handleAutoSave({ sessionAutoSyncEnabled })

@@ -1202,8 +1202,8 @@ pub fn schedule_tray_refresh(app: &tauri::AppHandle) {
 /// 雪崩请求；互斥锁被毒化时以上次状态为准继续推进，不会永久阻塞。
 ///
 /// 刷新面与 `format_usage_suffix` 的展示面严格对齐 —— 每次悬停最多发
-/// `TRAY_SECTIONS.len()` 个用量查询；按供应商用量开关查询，Codex 托管账号
-/// 未保存开关时与卡片一致默认启用。
+/// `TRAY_SECTIONS.len()` 个用量查询；按供应商用量开关查询。
+/// Codex 托管账号仅展示后台五分钟检查或手动刷新写入的缓存，悬停不发请求。
 pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
     use crate::commands::CopilotAuthState;
     use futures::future::join_all;
@@ -1273,17 +1273,7 @@ pub(crate) async fn refresh_all_usage_in_tray(app: &tauri::AppHandle) {
             let app_str = app_type_str.to_string();
             usage_futures.push(async move {
                 let result = match source {
-                    TrayUsageSource::ManagedCodex(account_id) => {
-                        let codex_state = app.state::<crate::commands::CodexOAuthState>();
-                        crate::commands::get_codex_oauth_quota(
-                            app_clone,
-                            state,
-                            Some(account_id),
-                            codex_state,
-                        )
-                        .await
-                        .map(|_| ())
-                    }
+                    TrayUsageSource::ManagedCodex(_) => Ok(()),
                     TrayUsageSource::Script => crate::commands::queryProviderUsage(
                         app_clone,
                         state,
