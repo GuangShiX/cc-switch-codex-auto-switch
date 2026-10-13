@@ -34,6 +34,7 @@ import {
 import { useQueryClient } from "@tanstack/react-query";
 import { usageKeys, useModelStats, useProviderStats } from "@/lib/query/usage";
 import { useUsageEventBridge } from "@/hooks/useUsageEventBridge";
+import { useUsageSessionSync } from "@/hooks/useUsageSessionSync";
 import {
   Accordion,
   AccordionContent,
@@ -112,7 +113,7 @@ export function UsageDashboard({
   );
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false);
   const [rebuildingCodex, setRebuildingCodex] = useState(false);
-  const [syncingSession, setSyncingSession] = useState(false);
+  const sessionSync = useUsageSessionSync(sessionAutoSyncEnabled);
 
   useEffect(() => {
     setRefreshIntervalMs(normalizeRefreshInterval(savedRefreshIntervalMs));
@@ -185,19 +186,20 @@ export function UsageDashboard({
     }
   };
 
-  // 手动触发一次会话日志同步：手动模式下是唯一的直连用量补录途径，
-  // 入口按钮仅在关闭自动扫描时展示（自动模式有后台定时扫描，无需手动触发）
+  // 手动刷新包含会话用量导入，然后刷新数据库统计；独立于后台扫描开关。
   const runManualSessionSync = async () => {
-    setSyncingSession(true);
     try {
-      const result = await usageApi.syncSessionUsage();
-      await queryClient.invalidateQueries({ queryKey: usageKeys.all });
+      const result = await sessionSync.refresh();
       const message = t("usage.sessionSync.syncCompleted", {
         imported: result.imported,
         files: result.filesScanned,
         errors: result.errors.length,
       });
-      if (result.errors.length > 0) {
+      if (
+        result.errors.length > 0 ||
+        result.deferredFiles > 0 ||
+        result.suspectedDuplicates > 0
+      ) {
         toast.warning(message);
       } else {
         toast.success(message);
@@ -208,8 +210,6 @@ export function UsageDashboard({
           error: String(error),
         }),
       );
-    } finally {
-      setSyncingSession(false);
     }
   };
 
@@ -290,6 +290,19 @@ export function UsageDashboard({
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={sessionSync.isSyncing || rebuildingCodex}
+            onClick={() => void runManualSessionSync()}
+          >
+            {sessionSync.isSyncing ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="mr-2 h-4 w-4" />
+            )}
+            {t("usage.sessionSync.refreshStats")}
+          </Button>
           <div className="flex items-center p-1 bg-muted/30 rounded-lg border border-border/50">
             {APP_FILTER_OPTIONS.map((type) => {
               const label = t(`usage.appFilter.${type}`);
@@ -406,6 +419,39 @@ export function UsageDashboard({
         </div>
       </div>
 
+      {sessionSync.isSyncing && (
+        <p
+          role="status"
+          className="flex items-center gap-2 text-sm text-muted-foreground"
+        >
+          <Loader2 className="h-4 w-4 animate-spin" />
+          {t("usage.sessionSync.syncing")}
+        </p>
+      )}
+      {sessionSync.error && (
+        <p role="alert" className="text-sm text-destructive">
+          {t("usage.sessionSync.syncFailed", {
+            error: String(sessionSync.error),
+          })}
+        </p>
+      )}
+      {!sessionSync.isSyncing &&
+        !sessionSync.error &&
+        sessionSync.result &&
+        (sessionSync.result.errors.length > 0 ||
+          sessionSync.result.deferredFiles > 0 ||
+          sessionSync.result.suspectedDuplicates > 0) && (
+          <p
+            role="status"
+            className="text-sm text-amber-600 dark:text-amber-400"
+          >
+            {t("usage.sessionSync.incomplete", {
+              errors: sessionSync.result.errors.length,
+              deferred: sessionSync.result.deferredFiles,
+              suspected: sessionSync.result.suspectedDuplicates,
+            })}
+          </p>
+        )}
       <UsageHero
         range={range}
         appType={appType === "all" ? undefined : appType}
@@ -496,21 +542,6 @@ export function UsageDashboard({
             </div>
           </div>
           <div className="flex items-center gap-3 shrink-0">
-            {!sessionAutoSyncEnabled && (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={syncingSession}
-                onClick={() => void runManualSessionSync()}
-              >
-                {syncingSession ? (
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                ) : (
-                  <RefreshCw className="mr-2 h-4 w-4" />
-                )}
-                {t("usage.sessionSync.syncNow")}
-              </Button>
-            )}
             <Switch
               checked={sessionAutoSyncEnabled}
               onCheckedChange={(value) =>
@@ -571,7 +602,7 @@ export function UsageDashboard({
                 </p>
                 <Button
                   variant="destructive"
-                  disabled={rebuildingCodex}
+                  disabled={rebuildingCodex || sessionSync.isSyncing}
                   onClick={() => setShowRebuildConfirm(true)}
                   className="shrink-0"
                 >

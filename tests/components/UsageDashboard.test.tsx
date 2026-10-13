@@ -13,10 +13,32 @@ import { UsageDashboard } from "@/components/usage/UsageDashboard";
 const useProviderStatsMock = vi.hoisted(() => vi.fn());
 const useModelStatsMock = vi.hoisted(() => vi.fn());
 const usageHeroMock = vi.hoisted(() => vi.fn());
+const syncSessionUsageMock = vi.hoisted(() => vi.fn());
+const toastMock = vi.hoisted(() => ({
+  success: vi.fn(),
+  warning: vi.fn(),
+  error: vi.fn(),
+}));
+
+vi.mock("@/lib/api/usage", () => ({
+  usageApi: { syncSessionUsage: syncSessionUsageMock },
+}));
+vi.mock("sonner", () => ({ toast: toastMock }));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    isVisible: async () => true,
+    isMinimized: async () => false,
+  }),
+}));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
-    t: (key: string, fallback?: string) => fallback ?? key,
+    t: (key: string, fallback?: string | Record<string, unknown>) =>
+      typeof fallback === "string"
+        ? fallback
+        : fallback
+          ? `${key}: ${JSON.stringify(fallback)}`
+          : key,
     i18n: {
       resolvedLanguage: "en",
       language: "en",
@@ -114,6 +136,15 @@ describe("UsageDashboard", () => {
     useProviderStatsMock.mockReset();
     useModelStatsMock.mockReset();
     usageHeroMock.mockReset();
+    syncSessionUsageMock.mockReset();
+    syncSessionUsageMock.mockResolvedValue({
+      imported: 12,
+      skipped: 0,
+      filesScanned: 3,
+      suspectedDuplicates: 0,
+      deferredFiles: 0,
+      errors: [],
+    });
     useProviderStatsMock.mockReturnValue({ data: [] });
     useModelStatsMock.mockReturnValue({ data: [] });
   });
@@ -141,8 +172,10 @@ describe("UsageDashboard", () => {
       { appType: "pi", providerName: undefined },
       expect.anything(),
     );
-    expect(usageHeroMock).toHaveBeenLastCalledWith(
-      expect.objectContaining({ appType: "pi" }),
+    await waitFor(() =>
+      expect(usageHeroMock).toHaveBeenLastCalledWith(
+        expect.objectContaining({ appType: "pi" }),
+      ),
     );
   });
 
@@ -178,5 +211,91 @@ describe("UsageDashboard", () => {
     await waitFor(() =>
       expect(screen.getByTestId("select-30000")).toBeInTheDocument(),
     );
+  });
+
+  it("imports once on entry and offers a top refresh action with background scanning enabled", async () => {
+    const onSessionAutoSyncEnabledChange = vi.fn();
+    renderDashboard({
+      sessionAutoSyncEnabled: true,
+      onSessionAutoSyncEnabledChange,
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "usage.sessionSync.refreshStats" }),
+      ).toBeEnabled(),
+    );
+    expect(syncSessionUsageMock).toHaveBeenCalledTimes(1);
+    fireEvent.click(
+      screen.getByRole("button", { name: "usage.sessionSync.refreshStats" }),
+    );
+    await waitFor(() => expect(syncSessionUsageMock).toHaveBeenCalledTimes(2));
+    expect(onSessionAutoSyncEnabledChange).not.toHaveBeenCalled();
+  });
+
+  it("marks imports as loading while retaining the existing database view", async () => {
+    let finish!: (value: unknown) => void;
+    syncSessionUsageMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderDashboard();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "usage.sessionSync.syncing",
+      ),
+    );
+    expect(screen.getByTestId("usage-hero")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "usage.sessionSync.refreshStats" }),
+    ).toBeDisabled();
+    finish({
+      imported: 1,
+      filesScanned: 1,
+      errors: [],
+      deferredFiles: 0,
+      suspectedDuplicates: 0,
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("usage-hero")).toBeInTheDocument(),
+    );
+  });
+
+  it("reports failed imports inline and recovers with manual refresh", async () => {
+    syncSessionUsageMock.mockRejectedValueOnce(new Error("Import unavailable"));
+    renderDashboard();
+    await waitFor(() =>
+      expect(screen.getByRole("alert")).toHaveTextContent("Import unavailable"),
+    );
+    expect(screen.getByTestId("usage-hero")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "usage.sessionSync.refreshStats" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("shows incomplete results for deferred or suspected duplicate files", async () => {
+    syncSessionUsageMock.mockResolvedValue({
+      imported: 5,
+      filesScanned: 3,
+      errors: [],
+      deferredFiles: 2,
+      suspectedDuplicates: 1,
+    });
+    renderDashboard();
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "usage.sessionSync.incomplete",
+      ),
+    );
+    expect(screen.getByRole("status")).toHaveTextContent('"deferred":2');
+    expect(screen.getByRole("status")).toHaveTextContent('"suspected":1');
+    fireEvent.click(
+      screen.getByRole("button", { name: "usage.sessionSync.refreshStats" }),
+    );
+    await waitFor(() => expect(toastMock.warning).toHaveBeenCalled());
   });
 });
