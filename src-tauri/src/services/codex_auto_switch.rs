@@ -161,8 +161,22 @@ pub fn lifecycle_status(app: &tauri::AppHandle, generation: u64, phase: &str, me
     });
 }
 
+pub fn saved_recovery_status(
+    app: &tauri::AppHandle,
+    generation: u64,
+    operation: &str,
+    provider: &str,
+) {
+    set_status(app, generation, |status| {
+        status.operation_id = Some(operation.into());
+        status.target_provider_id = Some(provider.into());
+        status.phase = "resuming".into();
+        status.message = "桌面和账号已重新核实，正在补完原任务恢复".into();
+    });
+}
+
 fn finish(app: &tauri::AppHandle, generation: u64, phase: &str, message: String) {
-    let has_uncertain_recovery = matches!(phase, "blocked" | "failed")
+    let has_uncertain_recovery = matches!(phase, "blocked" | "failed" | "waiting")
         && (crate::services::codex_desktop_bridge::pending_recovery_reason().is_some()
             || crate::services::codex_desktop_bridge::quota_reset_wait()
                 .ok()
@@ -335,7 +349,11 @@ pub fn start(app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut next_check = tokio::time::Instant::now() + CHECK_INTERVAL;
+        // Normal monitoring keeps its five-minute cadence. A saved unfinished
+        // recovery is checked once at startup instead of leaving work paused.
+        let startup_recovery =
+            crate::services::codex_desktop_bridge::pending_recovery_reason().is_some();
+        let mut next_check = tokio::time::Instant::now() + initial_check_delay(startup_recovery);
         let mut observed_reset = None;
         loop {
             interval.tick().await;
@@ -374,11 +392,22 @@ pub fn start(app: tauri::AppHandle) {
     });
 }
 
+fn initial_check_delay(pending_recovery: bool) -> Duration {
+    if pending_recovery {
+        Duration::ZERO
+    } else {
+        CHECK_INTERVAL
+    }
+}
+
 pub fn get_status(_app: &tauri::AppHandle) -> CodexAutoSwitchStatus {
     lock_runtime().status.clone()
 }
 
 pub fn set_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<CodexAutoSwitchStatus, String> {
+    let cancel_automatic_recovery = !enabled && lock_runtime().manual_generation.is_none();
+    let captured_recovery = cancel_automatic_recovery
+        .then(crate::services::codex_desktop_bridge::recovery_records_for_cancellation);
     if enabled {
         crate::services::codex_session_watch::ensure_started()?;
     }
@@ -390,8 +419,9 @@ pub fn set_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<CodexAutoSwi
     if enabled {
         persisted.as_ref().map_err(|error| error.clone())?;
     }
-    let status = {
+    let (mut status, cancel_captured) = {
         let mut inner = lock_runtime();
+        let cancel_captured = !enabled && inner.manual_generation.is_none();
         apply_enabled_choice(
             &mut inner,
             enabled,
@@ -402,8 +432,20 @@ pub fn set_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<CodexAutoSwi
                 "本次自动换号已关闭，旧计划已停止，但开关保存失败：{error}；下次启动前需核对开关"
             );
         }
-        inner.status.clone()
+        (inner.status.clone(), cancel_captured)
     };
+    if let Some(captured) = captured_recovery.filter(|_| cancel_captured) {
+        if let Err(error) = captured.and_then(|paths| {
+            crate::services::codex_desktop_bridge::cancel_captured_recovery_records(&paths)
+        }) {
+            status.message = format!("自动换号已关闭，旧任务恢复已停止；取消记录未完成：{error}");
+            status.can_cancel = true;
+            let mut inner = lock_runtime();
+            if !inner.status.enabled {
+                inner.status = status.clone();
+            }
+        }
+    }
     publish(app, &status);
     Ok(status)
 }
@@ -1108,7 +1150,10 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     // A previous desktop recovery must not freeze quota monitoring. Refresh
     // the current account first, then reconcile only provably obsolete tickets.
     let reconciled = match crate::services::codex_desktop_bridge::reconcile_obsolete_recovery(
-        &app, generation, &current,
+        &app,
+        generation,
+        &current,
+        matches!(quota_decision(&current_quota), Ok(QuotaDecision::Usable)),
     )
     .await
     {
@@ -1122,7 +1167,7 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
         return;
     }
     if let Some(reason) = crate::services::codex_desktop_bridge::pending_recovery_reason() {
-        finish(&app, generation, "blocked", reason);
+        finish(&app, generation, "waiting", reason);
         return;
     }
     if reconciled > 0 {
@@ -1619,6 +1664,12 @@ pub fn cancel_codex_auto_switch(app: tauri::AppHandle) -> CodexAutoSwitchStatus 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_recovery_is_checked_on_startup_while_normal_monitoring_waits_five_minutes() {
+        assert_eq!(initial_check_delay(true), Duration::ZERO);
+        assert_eq!(initial_check_delay(false), Duration::from_secs(300));
+    }
 
     fn blocked_check() -> Runtime {
         let mut inner = Runtime::default();

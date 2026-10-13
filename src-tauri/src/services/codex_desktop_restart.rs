@@ -246,17 +246,164 @@ pub fn ensure_same_desktop(expected: &Option<DesktopReceipt>) -> Result<(), Stri
 
 pub fn ensure_identity_desktop(expected: &IdentityReceipt) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    let actual = receipt_for(&native::desktops()?);
+    {
+        let main = native::identity_main(expected)?;
+        let started = std::time::Instant::now();
+        let deadline = identity_check_deadline(started);
+        let mut watch = IdentityDesktopWatch::default();
+        loop {
+            // Do not infer the bound main's exit from an enumeration race.
+            // Its kernel process identity is checked on both sides of each
+            // snapshot, including every observation of a protocol handoff.
+            let before = native::identity_main(expected)?;
+            let roots = native::desktops()?;
+            let after = native::identity_main(expected)?;
+            if before != main || after != main {
+                return Err("本次新桌面的包身份或运行状态已改变；未恢复旧任务".into());
+            }
+            let observation = watch.observe(&main, &roots, started.elapsed());
+            let observation = if std::time::Instant::now() >= deadline && observation.is_ok() {
+                Err("本次新桌面进程清单已达到本次等待上限；未重复导航或发送继续".into())
+            } else {
+                observation
+            };
+            match observation {
+                Ok(true) => {
+                    if watch.needs_settle {
+                        log::info!(
+                            "Codex 新桌面的进程清单已收敛（核对 {} 次，缺主根 {} 次，最多 {} 个根，耗时 {} 毫秒）",
+                            watch.observations,
+                            watch.missing_main_observations,
+                            watch.peak_roots,
+                            started.elapsed().as_millis()
+                        );
+                    }
+                    return Ok(());
+                }
+                Ok(false) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(reason) => {
+                    log::warn!(
+                        "Codex 新桌面进程核对未通过（核对 {} 次，缺主根 {} 次，本次 {} 个根，最多 {} 个根，耗时 {} 毫秒）：{reason}",
+                        watch.observations,
+                        watch.missing_main_observations,
+                        roots.len(),
+                        watch.peak_roots,
+                        started.elapsed().as_millis()
+                    );
+                    return Err(reason);
+                }
+            }
+        }
+    }
     #[cfg(not(target_os = "windows"))]
-    let actual = desktop_receipt()?;
-    if actual.as_ref().is_some_and(|receipt| {
-        receipt.roots.len() == 1
-            && receipt.roots[0].pid == expected.pid
-            && receipt.roots[0].birth == expected.birth
-    }) {
-        Ok(())
-    } else {
-        Err("本次新桌面已退出、被重开或出现其他实例；未恢复旧任务".into())
+    {
+        let actual = desktop_receipt()?;
+        if actual.as_ref().is_some_and(|receipt| {
+            receipt.roots.len() == 1
+                && receipt.roots[0].pid == expected.pid
+                && receipt.roots[0].birth == expected.birth
+        }) {
+            Ok(())
+        } else {
+            Err("本次新桌面已退出、被重开或出现其他实例；未恢复旧任务".into())
+        }
+    }
+}
+
+// A synchronous navigation guard runs inside the navigation deadline rather
+// than starting another independent five-second inventory wait. This scope
+// never crosses an await, so a future moving threads cannot leak the deadline.
+thread_local! {
+    static IDENTITY_CHECK_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn identity_check_deadline(started: std::time::Instant) -> std::time::Instant {
+    let local = started + std::time::Duration::from_secs(5);
+    IDENTITY_CHECK_DEADLINE.with(|slot| slot.get().map_or(local, |outer| local.min(outer)))
+}
+
+fn with_identity_deadline<T>(deadline: std::time::Instant, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<std::time::Instant>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IDENTITY_CHECK_DEADLINE.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = IDENTITY_CHECK_DEADLINE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(previous.map_or(deadline, |outer| outer.min(deadline))));
+        Reset(previous)
+    });
+    action()
+}
+
+fn exact_identity_main(
+    expected: &IdentityReceipt,
+    actual: Option<Desktop>,
+) -> Result<Desktop, String> {
+    actual
+        .filter(|desktop| desktop.pid == expected.pid && desktop.birth == expected.birth)
+        .ok_or_else(|| "本次新桌面主进程已退出或被重开；未恢复旧任务".into())
+}
+
+/// The guard is also invoked before navigation's own settling loop. A
+/// temporary startup/protocol entry or an incomplete enumerated snapshot has
+/// to settle here without dropping the exact main-process, package or Windows-
+/// session checks. The caller must prove the main through kernel handles on
+/// both sides of every snapshot. No action is allowed until a complete unique
+/// snapshot is stable; ordinary unique observations remain immediate.
+#[derive(Default)]
+struct IdentityDesktopWatch {
+    needs_settle: bool,
+    unique_since: Option<std::time::Duration>,
+    observations: u32,
+    missing_main_observations: u32,
+    peak_roots: usize,
+}
+
+impl IdentityDesktopWatch {
+    fn observe(
+        &mut self,
+        expected: &Desktop,
+        roots: &[Desktop],
+        elapsed: std::time::Duration,
+    ) -> Result<bool, String> {
+        use std::time::Duration;
+        self.observations += 1;
+        self.peak_roots = self.peak_roots.max(roots.len());
+        validate_restart_roots(roots)?;
+        if roots.iter().any(|root| !same_package(root, expected)) {
+            return Err("本次新桌面进程清单包含不同包身份；未恢复旧任务".into());
+        }
+        let contains_main = roots.contains(expected);
+        if !contains_main {
+            self.missing_main_observations += 1;
+        }
+        if elapsed >= Duration::from_secs(5) {
+            return Err(if contains_main {
+                "本次新桌面的额外入口超过 5 秒仍未收敛到唯一实例；未重复导航或发送继续"
+            } else {
+                "本次新桌面主进程仍存活，但进程清单超过 5 秒仍未稳定包含主根；未重复导航或发送继续"
+            }
+            .into());
+        }
+        if !contains_main {
+            self.needs_settle = true;
+            self.unique_since = None;
+            return Ok(false);
+        }
+        if roots.len() == 1 {
+            if !self.needs_settle {
+                return Ok(true);
+            }
+            let since = self.unique_since.get_or_insert(elapsed);
+            return Ok(elapsed.saturating_sub(*since) >= Duration::from_millis(400));
+        }
+        self.needs_settle = true;
+        self.unique_since = None;
+        Ok(false)
     }
 }
 
@@ -277,11 +424,16 @@ impl NavigationWatch {
         elapsed: std::time::Duration,
     ) -> Result<bool, String> {
         use std::time::Duration;
-        if !roots.contains(expected) {
-            return Err("打开原聊天时本次新桌面已退出或被重开；未恢复旧任务".into());
-        }
         if elapsed >= Duration::from_secs(5) {
             return Err("打开原聊天后桌面进程未收敛到本次唯一实例；未重复导航或发送继续".into());
+        }
+        // The production inspector proves the exact main is alive before
+        // and after this snapshot. A transient omission is therefore not an
+        // exit; it cannot authorize continuation until a unique snapshot is
+        // stable. A kernel exit/reuse is rejected by the inspector immediately.
+        if !roots.contains(expected) {
+            self.unique_since = None;
+            return Ok(false);
         }
         if roots.len() == 1 {
             let since = self.unique_since.get_or_insert(elapsed);
@@ -305,21 +457,25 @@ pub async fn wait_for_navigation(
 ) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        let actual = native::desktops()?;
-        let root = actual
-            .iter()
-            .find(|desktop| desktop.pid == expected.pid && desktop.birth == expected.birth)
-            .ok_or_else(|| "本次新桌面已退出或被重开；未恢复旧任务".to_string())?;
-        let expected = receipt_for(std::slice::from_ref(root)).unwrap();
-        wait_for_navigation_with(&expected, guard, || {
-            Ok(native::desktops()?
+        let main = native::identity_main(expected)?;
+        let bound_receipt = receipt_for(std::slice::from_ref(&main)).unwrap();
+        wait_for_navigation_with(&bound_receipt, guard, || {
+            let before = native::identity_main(expected)?;
+            let roots = native::desktops()?;
+            let after = native::identity_main(expected)?;
+            if before != main || after != main {
+                return Err("打开原聊天时本次新桌面的身份已改变；未恢复旧任务".into());
+            }
+            validate_restart_roots(&roots)?;
+            if roots.iter().any(|root| !same_package(root, &main)) {
+                return Err("打开原聊天时出现不同包身份的桌面；未恢复旧任务".into());
+            }
+            Ok(roots
                 .into_iter()
                 .map(|desktop| receipt_for(std::slice::from_ref(&desktop)).unwrap())
                 .collect())
         })
-        .await?;
-        ensure_same_desktop(&Some(expected))?;
-        guard()
+        .await
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -334,11 +490,15 @@ async fn wait_for_navigation_with(
     mut inspect: impl FnMut() -> Result<Vec<DesktopReceipt>, String> + Send,
 ) -> Result<(), String> {
     let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(5);
     let mut watch = NavigationWatch::default();
     loop {
-        guard()?;
+        if std::time::Instant::now() >= deadline {
+            return Err("打开原聊天后的进程核对达到 5 秒上限；未重复导航或发送继续".into());
+        }
+        with_identity_deadline(deadline, guard)?;
         let roots = inspect()?;
-        guard()?;
+        with_identity_deadline(deadline, guard)?;
         if watch.observe(expected, &roots, started.elapsed())? {
             return Ok(());
         }
@@ -648,8 +808,9 @@ fn restart_with_action_mode(
 #[cfg(target_os = "windows")]
 mod native {
     use super::{
-        root_desktops_from_rows, same_package, same_process_set, validate_restart_roots, Desktop,
-        DesktopProcessRow, DesktopSettleWatch, IdentityReceipt, RestartRuntime, IDENTITY_RECEIPT,
+        exact_identity_main, root_desktops_from_rows, same_package, same_process_set,
+        validate_restart_roots, Desktop, DesktopProcessRow, DesktopSettleWatch, IdentityReceipt,
+        RestartRuntime, IDENTITY_RECEIPT,
     };
     use std::ffi::c_void;
     use std::ptr::{null, null_mut};
@@ -804,6 +965,17 @@ mod native {
                 application_id,
             }))
         }
+    }
+
+    /// `process` checks liveness, birth, the installed package identity and
+    /// the current Windows login session through kernel handles. A vanished
+    /// or reused PID cannot be repaired by waiting for another enumeration.
+    pub(super) fn identity_main(expected: &IdentityReceipt) -> Result<Desktop, String> {
+        let result = process(expected.pid).and_then(|main| exact_identity_main(expected, main));
+        if let Err(reason) = &result {
+            log::warn!("Codex 本次主进程的内核身份核对未通过：{reason}");
+        }
+        result
     }
 
     fn desktop_process_rows() -> Result<Vec<DesktopProcessRow>, String> {
@@ -1560,6 +1732,25 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "explicit metadata-only local process receipt required"]
+    fn readonly_live_identity_guard_checks_existing_desktop_without_mutation() {
+        let path = std::env::var_os("CC_SWITCH_READONLY_IDENTITY_RECEIPT")
+            .expect("provide an explicit metadata-only receipt file");
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("read metadata-only receipt"))
+                .expect("parse metadata-only receipt");
+        let receipt = IdentityReceipt {
+            pid: u32::try_from(value["pid"].as_u64().expect("pid")).expect("pid range"),
+            birth: value["birth"].as_u64().expect("birth"),
+            port: u16::try_from(value["port"].as_u64().expect("port")).expect("port range"),
+        };
+        // Kernel handles and ToolHelp snapshots only. No app activation,
+        // navigation, account service, shutdown or continuation is invoked.
+        ensure_identity_desktop(&receipt).expect("current bound desktop remains valid");
+    }
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -1799,8 +1990,12 @@ mod tests {
             )
             .is_err());
         for roots in [vec![], vec![extra], vec![synthetic_receipt(10, 21)]] {
-            assert!(NavigationWatch::default()
+            let mut incomplete = NavigationWatch::default();
+            assert!(!incomplete
                 .observe(&expected, &roots, Duration::ZERO)
+                .unwrap());
+            assert!(incomplete
+                .observe(&expected, &roots, Duration::from_secs(5))
                 .is_err());
         }
         let mut late = NavigationWatch::default();
@@ -1810,6 +2005,71 @@ mod tests {
         assert!(late
             .observe(&expected, &[expected.clone()], Duration::from_millis(5100))
             .is_err());
+    }
+
+    #[test]
+    fn navigation_waits_for_enumeration_to_recover_without_adopting_a_different_main() {
+        use std::time::Duration;
+        let expected = synthetic_receipt(10, 20);
+        let mut watch = NavigationWatch::default();
+        for (millis, roots, ready) in [
+            (0, vec![], false),
+            (100, vec![synthetic_receipt(10, 21)], false),
+            (200, vec![expected.clone()], false),
+            (300, vec![], false),
+            (400, vec![expected.clone()], false),
+            (800, vec![expected.clone()], false),
+            (1000, vec![expected.clone()], true),
+        ] {
+            assert_eq!(
+                watch
+                    .observe(&expected, &roots, Duration::from_millis(millis))
+                    .unwrap(),
+                ready
+            );
+        }
+    }
+
+    #[test]
+    fn nested_navigation_identity_guards_share_one_deadline_and_restore_the_scope() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        assert!(IDENTITY_CHECK_DEADLINE.with(|slot| slot.get()).is_none());
+        let result: Result<(), String> = with_identity_deadline(deadline, || {
+            assert_eq!(
+                identity_check_deadline(started + Duration::from_secs(4)),
+                deadline
+            );
+            with_identity_deadline(deadline + Duration::from_secs(5), || {
+                assert_eq!(
+                    identity_check_deadline(started + Duration::from_secs(4)),
+                    deadline
+                );
+                Err("cancelled".into())
+            })
+        });
+        assert!(result.is_err());
+        assert!(IDENTITY_CHECK_DEADLINE.with(|slot| slot.get()).is_none());
+    }
+
+    #[tokio::test]
+    async fn navigation_kernel_main_exit_fails_before_waiting_for_a_missing_snapshot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inspections = AtomicUsize::new(0);
+        let result = wait_for_navigation_with(&synthetic_receipt(10, 20), &|| Ok(()), || {
+            inspections.fetch_add(1, Ordering::SeqCst);
+            let expected = IdentityReceipt {
+                pid: 10,
+                birth: 20,
+                port: 12345,
+            };
+            exact_identity_main(&expected, None)?;
+            Ok(vec![])
+        })
+        .await;
+        assert!(result.unwrap_err().contains("主进程已退出"));
+        assert_eq!(inspections.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1865,6 +2125,190 @@ mod tests {
 
     fn synthetic_receipt(pid: u32, birth: u64) -> DesktopReceipt {
         receipt_for(&[synthetic_desktop(pid, birth)]).unwrap()
+    }
+
+    #[test]
+    fn identity_guard_does_not_delay_an_ordinary_unique_desktop() {
+        let main = synthetic_desktop(10, 20);
+        let mut watch = IdentityDesktopWatch::default();
+        assert!(watch
+            .observe(
+                &main,
+                std::slice::from_ref(&main),
+                std::time::Duration::ZERO
+            )
+            .unwrap());
+        assert!(!watch.needs_settle);
+        assert_eq!(watch.observations, 1);
+    }
+
+    #[test]
+    fn identity_guard_kernel_main_disappearance_or_pid_reuse_fails_immediately() {
+        let expected = IdentityReceipt {
+            pid: 10,
+            birth: 20,
+            port: 12345,
+        };
+        assert_eq!(
+            exact_identity_main(&expected, Some(synthetic_desktop(10, 20))).unwrap(),
+            synthetic_desktop(10, 20)
+        );
+        for actual in [
+            None,
+            Some(synthetic_desktop(10, 21)),
+            Some(synthetic_desktop(11, 20)),
+        ] {
+            assert!(exact_identity_main(&expected, actual).is_err());
+        }
+    }
+
+    #[test]
+    fn identity_guard_allows_a_transient_protocol_root_to_settle_before_navigation_wait() {
+        use std::time::Duration;
+        let main = synthetic_desktop(10, 20);
+        let extra = synthetic_desktop(11, 21);
+        let mut watch = IdentityDesktopWatch::default();
+        for (millis, roots, ready) in [
+            (0, vec![main.clone(), extra], false),
+            (100, vec![main.clone()], false),
+            (450, vec![main.clone()], false),
+            (500, vec![main.clone()], true),
+        ] {
+            assert_eq!(
+                watch
+                    .observe(&main, &roots, Duration::from_millis(millis))
+                    .unwrap(),
+                ready
+            );
+        }
+        assert!(watch.needs_settle);
+        assert_eq!(watch.peak_roots, 2);
+        assert_eq!(watch.observations, 4);
+    }
+
+    #[test]
+    fn identity_guard_reappearance_resets_the_unique_stability_period() {
+        use std::time::Duration;
+        let main = synthetic_desktop(10, 20);
+        let extra = synthetic_desktop(11, 21);
+        let mut watch = IdentityDesktopWatch::default();
+        for (millis, roots) in [
+            (0, vec![main.clone(), extra.clone()]),
+            (100, vec![main.clone()]),
+            (400, vec![main.clone(), extra]),
+            (450, vec![main.clone()]),
+            (800, vec![main.clone()]),
+        ] {
+            assert!(!watch
+                .observe(&main, &roots, Duration::from_millis(millis))
+                .unwrap());
+        }
+        assert!(watch
+            .observe(&main, &[main.clone()], Duration::from_millis(850))
+            .unwrap());
+    }
+
+    #[test]
+    fn identity_guard_never_adopts_an_unbound_main_from_an_incomplete_snapshot() {
+        use std::time::Duration;
+        let main = synthetic_desktop(10, 20);
+        let extra = synthetic_desktop(11, 21);
+        for roots in [
+            vec![],
+            vec![extra.clone()],
+            vec![synthetic_desktop(10, 22), extra.clone()],
+            vec![synthetic_desktop(12, 20), extra.clone()],
+        ] {
+            let mut watch = IdentityDesktopWatch::default();
+            assert!(!watch
+                .observe(&main, &[main.clone(), extra.clone()], Duration::ZERO)
+                .unwrap());
+            assert!(!watch
+                .observe(&main, &roots, Duration::from_millis(50))
+                .unwrap());
+            assert_eq!(watch.missing_main_observations, 1);
+            assert!(watch
+                .observe(&main, &roots, Duration::from_secs(5))
+                .unwrap_err()
+                .contains("主进程仍存活"));
+        }
+    }
+
+    #[test]
+    fn identity_guard_retries_a_missing_root_only_while_the_exact_kernel_main_survives() {
+        use std::time::Duration;
+        let main = synthetic_desktop(10, 20);
+        let mut watch = IdentityDesktopWatch::default();
+        for (millis, roots, ready) in [
+            (0, vec![], false),
+            (50, vec![synthetic_desktop(11, 21)], false),
+            (100, vec![main.clone()], false),
+            (450, vec![main.clone()], false),
+            (500, vec![main.clone()], true),
+        ] {
+            assert_eq!(
+                watch
+                    .observe(&main, &roots, Duration::from_millis(millis))
+                    .unwrap(),
+                ready
+            );
+        }
+        assert_eq!(watch.missing_main_observations, 2);
+        assert_eq!(watch.observations, 5);
+    }
+
+    #[test]
+    fn identity_guard_foreign_package_or_ambiguous_root_fails_without_waiting() {
+        let main = synthetic_desktop(10, 20);
+        for extra in [
+            Desktop {
+                family: "OpenAI.Codex_other".into(),
+                ..synthetic_desktop(11, 21)
+            },
+            Desktop {
+                application_id: "OpenAI.Codex_test!Other".into(),
+                ..synthetic_desktop(11, 21)
+            },
+            synthetic_desktop(10, 22),
+        ] {
+            assert!(IdentityDesktopWatch::default()
+                .observe(&main, &[main.clone(), extra], std::time::Duration::ZERO)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn identity_guard_persistent_or_changing_extra_roots_have_a_five_second_deadline() {
+        use std::time::Duration;
+        let main = synthetic_desktop(10, 20);
+        let mut watch = IdentityDesktopWatch::default();
+        assert!(!watch
+            .observe(
+                &main,
+                &[main.clone(), synthetic_desktop(11, 21)],
+                Duration::ZERO
+            )
+            .unwrap());
+        assert!(!watch
+            .observe(
+                &main,
+                &[main.clone(), synthetic_desktop(12, 22)],
+                Duration::from_millis(4999)
+            )
+            .unwrap());
+        assert!(watch
+            .observe(
+                &main,
+                &[main.clone(), synthetic_desktop(13, 23)],
+                Duration::from_secs(5)
+            )
+            .unwrap_err()
+            .contains("5 秒"));
+        // A main which only becomes unique at the deadline has not been
+        // stable long enough, and must not extend the caller's wait.
+        assert!(watch
+            .observe(&main, &[main.clone()], Duration::from_secs(5))
+            .is_err());
     }
 
     #[test]

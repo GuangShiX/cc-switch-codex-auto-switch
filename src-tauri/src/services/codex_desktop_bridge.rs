@@ -50,6 +50,8 @@ struct RecoveryRecord {
     settings_restored_tasks: Vec<String>,
     resumed_tasks: Vec<String>,
     resume_confirmations: Vec<ResumeConfirmation>,
+    #[serde(default)]
+    resume_not_sent_tasks: Vec<String>,
 }
 
 impl Drop for RecoveryRecord {
@@ -267,8 +269,8 @@ pub fn pending_recovery_reason() -> Option<String> {
         let Ok(record) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
             return Some("上次桌面恢复记录损坏；未自动重放操作".into());
         };
-        if record["phase"] == "needs-review" {
-            return Some("上次退出或原聊天恢复结果未确认；已停止自动重放。请核对桌面状态，可重新手动启用账号".into());
+        if recoverable_resume_phase(record["phase"].as_str()) {
+            return Some(recovery_pending_description(&record));
         }
         if !matches!(
             record["phase"].as_str(),
@@ -284,7 +286,7 @@ pub fn pending_recovery_reason() -> Option<String> {
 }
 
 fn confirmed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
-    if record.phase != "needs-review"
+    if !recoverable_resume_phase(Some(&record.phase))
         || record.target_provider_id != current
         || !record.desktop_restarted
         || !record.runtime_identity_confirmed
@@ -342,6 +344,21 @@ fn confirmed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool 
     })
 }
 
+fn recoverable_resume_phase(phase: Option<&str>) -> bool {
+    matches!(
+        phase,
+        Some(
+            "needs-review"
+                | "reopened"
+                | "recovering-saved-tasks"
+                | "resume-intent"
+                | "resume-outcome-needs-review"
+                | "resume-not-sent"
+                | "resumed"
+        )
+    )
+}
+
 #[cfg(test)]
 fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
     confirmed_recovery_candidate(record, current)
@@ -358,6 +375,28 @@ fn late_resume_candidate(record: &RecoveryRecord, current: &str) -> bool {
     // may be superseded by proven user changes, never started from here.
     changed_recovery_candidate(record, current)
         && record.resume_intents.len() == record.paused_tasks.len()
+}
+
+fn recovery_pending_description(record: &serde_json::Value) -> String {
+    let tasks = record["pausedTasks"].as_array().map_or(0, Vec::len);
+    let sent = record["resumeIntents"].as_array().map_or(0, Vec::len);
+    if record["runtimeIdentityConfirmed"] == true {
+        format!("账号和重开桌面已确认；原任务 {} 条，恢复请求已记录 {} 条。后台会核对原轮次并补完尚未发送的任务，已发送的请求只确认结果", tasks, sent)
+    } else {
+        "桌面退出或实际账号核验未完成；具体原因已保存在失败记录，确认前不恢复任务".into()
+    }
+}
+
+fn unsent_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
+    changed_recovery_candidate(record, current)
+        && record
+            .paused_tasks
+            .iter()
+            .any(|task| !record.resume_intents.contains(&task.thread_id))
+        && record
+            .paused_tasks
+            .iter()
+            .all(|task| task.saved_settings.is_some())
 }
 
 fn changed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
@@ -382,6 +421,17 @@ fn changed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
         && record.resume_confirmations.iter().all(|confirmation| {
             confirmation.operation_id == record.operation_id
                 && record.resume_intents.contains(&confirmation.thread_id)
+        })
+        && record.resumed_tasks.iter().all(|id| {
+            record.settings_restored_tasks.contains(id)
+                && record.resume_confirmations.iter().any(|confirmation| {
+                    confirmation.thread_id == *id
+                        && confirmation.operation_id == record.operation_id
+                        && !confirmation.turn_id.is_empty()
+                        && record.paused_tasks.iter().any(|saved| {
+                            saved.thread_id == *id && saved.turn_id != confirmation.turn_id
+                        })
+                })
         })
 }
 
@@ -450,6 +500,7 @@ pub async fn reconcile_obsolete_recovery(
     app: &tauri::AppHandle,
     generation: u64,
     current: &str,
+    allow_unsent_recovery: bool,
 ) -> Result<usize, String> {
     let Ok(_flow) = FLOW_LOCK.try_lock() else {
         return Ok(0);
@@ -470,10 +521,10 @@ pub async fn reconcile_obsolete_recovery(
             continue;
         }
         let value = read_recovery_value(&path)?;
-        if value["phase"] != "needs-review" {
+        if !recoverable_resume_phase(value["phase"].as_str()) {
             continue;
         }
-        let record = read_record(&path)?;
+        let mut record = read_record(&path)?;
         let late_resume = late_resume_candidate(&record, current);
         if !changed_recovery_candidate(&record, current) {
             continue;
@@ -492,6 +543,31 @@ pub async fn reconcile_obsolete_recovery(
         let expected = current_login_identity(app, current).await?;
         guard()?;
         confirm_identity_receipt(&expected, &receipt, &guard).await?;
+        if allow_unsent_recovery && unsent_recovery_candidate(&record, current) {
+            monitor::retain_owned_recovery(generation)?;
+            if !claim_unsent_recovery(&path, &value, generation, current, guard.as_ref())? {
+                continue;
+            }
+            record.generation = generation;
+            record.phase = "recovering-saved-tasks".into();
+            record.loaded = false;
+            guard()?;
+            monitor::saved_recovery_status(app, generation, &record.operation_id, current);
+            resume_saved_tasks(
+                app,
+                generation,
+                &mut record,
+                guard.clone(),
+                Some(&expected),
+                receipt,
+                true,
+            )
+            .await?;
+            record.phase = "completed".into();
+            record.persist()?;
+            reconciled += 1;
+            continue;
+        }
         if late_resume {
             let mut session = connect_reopened_desktop(&guard).await?;
             let mut confirmations = Vec::new();
@@ -571,10 +647,10 @@ fn complete_late_recovery(
     confirmations: &[ResumeConfirmation],
     guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
 ) -> Result<bool, String> {
-    let _record_lock = RECORD_LOCK
+    guard()?;
+    let record_lock = RECORD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard()?;
     let mut value = read_recovery_value(path)?;
     if value != *expected {
         return Ok(false);
@@ -609,7 +685,32 @@ fn complete_late_recovery(
     value["settingsRestoredTasks"] = serde_json::json!(ids);
     value["settlementReason"] =
         serde_json::json!("只读核对已确认本次恢复的新轮次及原模型、项目和权限；未重复发送继续");
-    commit_recovery_value(path, &value, guard)?;
+    commit_recovery_value(path, &value)?;
+    drop(record_lock);
+    guard()?;
+    Ok(true)
+}
+
+fn claim_unsent_recovery(
+    path: &std::path::Path,
+    expected: &serde_json::Value,
+    generation: u64,
+    current: &str,
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<bool, String> {
+    guard()?;
+    let record_lock = RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut value = read_recovery_value(path)?;
+    if value != *expected || !unsent_recovery_candidate(&read_record(path)?, current) {
+        return Ok(false);
+    }
+    value["generation"] = serde_json::json!(generation);
+    value["phase"] = serde_json::json!("recovering-saved-tasks");
+    commit_recovery_value(path, &value)?;
+    drop(record_lock);
+    guard()?;
     Ok(true)
 }
 
@@ -619,10 +720,10 @@ fn supersede_obsolete_recovery(
     saved: &[PausedTask],
     guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
 ) -> Result<bool, String> {
-    let _record_lock = RECORD_LOCK
+    guard()?;
+    let record_lock = RECORD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard()?;
     let mut value = read_recovery_value(path)?;
     if value != *expected {
         return Ok(false);
@@ -645,15 +746,13 @@ fn supersede_obsolete_recovery(
     value["supersededReason"] = serde_json::json!(
         "只读核对确认本次保存的原任务均已被继续、完成或等待用户处理；旧计划失效，未重放任何操作"
     );
-    commit_recovery_value(path, &value, guard)?;
+    commit_recovery_value(path, &value)?;
+    drop(record_lock);
+    guard()?;
     Ok(true)
 }
 
-fn commit_recovery_value(
-    path: &std::path::Path,
-    value: &serde_json::Value,
-    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
-) -> Result<(), String> {
+fn commit_recovery_value(path: &std::path::Path, value: &serde_json::Value) -> Result<(), String> {
     use std::io::Write;
     let encoded = serde_json::to_vec(&value).map_err(|_| "无法编码旧恢复记录终态")?;
     if encoded.len() > 1_048_576 {
@@ -667,7 +766,6 @@ fn commit_recovery_value(
     file.as_file()
         .sync_all()
         .map_err(|_| "无法同步旧恢复记录终态")?;
-    guard()?;
     file.persist(path).map_err(|_| "无法提交旧恢复记录终态")?;
     Ok(())
 }
@@ -1129,6 +1227,7 @@ pub async fn resume_quota_reset_wait(
         guard,
         Some(&expected),
         receipt,
+        false,
     )
     .await
     {
@@ -1201,6 +1300,7 @@ async fn run_lifecycle(
         settings_restored_tasks: Vec::new(),
         resumed_tasks: Vec::new(),
         resume_confirmations: Vec::new(),
+        resume_not_sent_tasks: Vec::new(),
     };
     monitor::lifecycle_status(
         &app,
@@ -1525,6 +1625,7 @@ async fn run_lifecycle(
             guard.clone(),
             expected_identity.as_ref(),
             receipt,
+            false,
         )
         .await?;
     }
@@ -1555,6 +1656,7 @@ async fn resume_saved_tasks(
     guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     expected_identity: Option<&DesktopIdentity>,
     receipt: restart::IdentityReceipt,
+    retry_unsent: bool,
 ) -> Result<(), String> {
     let navigation_receipt = receipt.clone();
     let previous_guard = guard.clone();
@@ -1576,6 +1678,7 @@ async fn resume_saved_tasks(
         resume_guard: resume_guard.clone(),
         expected_identity,
         navigation_receipt,
+        retry_unsent,
     };
     recover_tasks_independently(
         &tasks,
@@ -1602,6 +1705,7 @@ struct SavedTaskRecovery<'a> {
     resume_guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     expected_identity: Option<&'a DesktopIdentity>,
     navigation_receipt: restart::IdentityReceipt,
+    retry_unsent: bool,
 }
 
 /// A failed/uncertain first chat must not prevent other independently owned
@@ -1656,6 +1760,20 @@ async fn resume_saved_task(
     if let Some(expected) = expected_identity {
         confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
     }
+    if record.resumed_tasks.contains(&paused.thread_id) {
+        return Ok(());
+    }
+    if record.resume_intents.contains(&paused.thread_id) {
+        // A persisted intent may already have written the request. Observe the
+        // original operation only; never route it through the start path.
+        let mut session = connect_reopened_desktop(&resume_guard).await?;
+        let confirmation = session
+            .reconcile_resume(paused, &record.operation_id)
+            .await
+            .map_err(|error| format!("正在核实已发送的原任务恢复：{error}"))?;
+        save_resume_confirmation(record, confirmation)?;
+        return Ok(());
+    }
     // Subscribe before navigation so the original owner registering
     // during startup cannot be missed by a one-shot subscription.
     let mut session = connect_reopened_desktop(&resume_guard).await?;
@@ -1674,10 +1792,32 @@ async fn resume_saved_task(
         "waiting-for-chat",
         "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
     );
-    let actual = session
+    let actual_result = session
         .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
-        .await
-        .map_err(|e| e.to_string())?;
+        .await;
+    let actual = match actual_result {
+        Ok(actual) => actual,
+        Err(error) => {
+            if context.retry_unsent && !error.mutation_may_have_been_sent {
+                if let Ok(current) = session.fresh_snapshot(&paused.thread_id).await {
+                    if saved_task_was_changed(paused, &current) {
+                        abandon_saved_task(record, &paused.thread_id)?;
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
+    };
+    if context.retry_unsent {
+        if let Err(error) = session.can_retry_saved_task(&actual, paused) {
+            if error.kind == SessionErrorKind::StateChanged {
+                abandon_saved_task(record, &paused.thread_id)?;
+                return Ok(());
+            }
+            return Err(error.to_string());
+        }
+    }
     if !record.wait_baselines.is_empty() {
         let baseline = record
             .wait_baselines
@@ -1711,6 +1851,15 @@ async fn resume_saved_task(
     let confirmation = match resume {
         Ok(confirmation) => confirmation,
         Err(error) => {
+            if withdraw_proven_unsent_intent(record, &paused.thread_id, &error) {
+                // This exact call proved it exited before the sole start
+                // write. A crash or ambiguous write never enters this path.
+                record.phase = "resume-not-sent".into();
+                record.persist()?;
+                return Err(format!(
+                    "原任务恢复请求尚未发送：{error}；后台将重新核对原轮次后处理"
+                ));
+            }
             // Reconciliation reads the new turn; it never repeats start.
             match session
                 .reconcile_resume(&paused, &record.operation_id)
@@ -1727,17 +1876,54 @@ async fn resume_saved_task(
             }
         }
     };
+    save_resume_confirmation(record, confirmation)?;
+    Ok(())
+}
+
+fn save_resume_confirmation(
+    record: &mut RecoveryRecord,
+    confirmation: ResumeConfirmation,
+) -> Result<(), String> {
+    let id = confirmation.thread_id.clone();
+    record
+        .resume_confirmations
+        .retain(|saved| saved.thread_id != id);
     record.resume_confirmations.push(confirmation);
     // The single original resume request resolves these settings as
     // part of starting its new turn. Record them only after the live
     // new turn's model, project and permission semantics are confirmed.
-    record
-        .settings_restored_tasks
-        .push(paused.thread_id.clone());
-    record.resumed_tasks.push(paused.thread_id.clone());
+    if !record.settings_restored_tasks.contains(&id) {
+        record.settings_restored_tasks.push(id.clone());
+    }
+    if !record.resumed_tasks.contains(&id) {
+        record.resumed_tasks.push(id);
+    }
     record.phase = "resumed".into();
     record.persist()?;
     Ok(())
+}
+
+fn abandon_saved_task(record: &mut RecoveryRecord, id: &str) -> Result<(), String> {
+    record.paused_tasks.retain(|task| task.thread_id != id);
+    if !record.abandoned_tasks.iter().any(|task| task == id) {
+        record.abandoned_tasks.push(id.into());
+    }
+    record.persist()
+}
+
+fn withdraw_proven_unsent_intent(
+    record: &mut RecoveryRecord,
+    id: &str,
+    error: &SessionError,
+) -> bool {
+    if error.mutation_may_have_been_sent {
+        return false;
+    }
+    record.resume_intents.retain(|saved| saved != id);
+    if !record.resume_not_sent_tasks.iter().any(|saved| saved == id) {
+        record.resume_not_sent_tasks.push(id.into());
+    }
+    true
 }
 
 async fn confirm_tasks_before_shutdown(
@@ -2191,7 +2377,7 @@ mod tests {
         for changed in 0..17 {
             let mut record = obsolete_record();
             match changed {
-                0 => record.phase = "resume-outcome-needs-review".into(),
+                0 => record.phase = "completed".into(),
                 1 => record.desktop_restarted = false,
                 2 => record.runtime_identity_confirmed = false,
                 3 => record.reopened_pid = None,
@@ -2226,6 +2412,208 @@ mod tests {
             .resume_intents
             .push(record.paused_tasks[0].thread_id.clone());
         record
+    }
+
+    fn retry_record() -> RecoveryRecord {
+        let mut record = obsolete_record();
+        record.paused_tasks[0].saved_settings = Some(codex_desktop_session::SavedTaskSettings {
+            thread_settings: json!({"model":"gpt-6.1-sol","approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}),
+            current_permissions: json!({"approvalPolicy":"on-request","sandboxPolicy":{"type":"readOnly"}}),
+        });
+        record
+    }
+
+    #[test]
+    fn unsent_recovery_requires_confirmed_desktop_owned_ticket_and_saved_settings() {
+        assert!(unsent_recovery_candidate(&retry_record(), "target"));
+        for changed in 0..10 {
+            let mut record = retry_record();
+            match changed {
+                0 => record.phase = "cancelled".into(),
+                1 => record.phase = "superseded".into(),
+                2 => record.target_provider_id = "another-account".into(),
+                3 => record.desktop_restarted = false,
+                4 => record.runtime_identity_confirmed = false,
+                5 => record.reopened_pid = None,
+                6 => record.reopened_birth = None,
+                7 => record.reopened_port = None,
+                8 => record.paused_tasks[0].saved_settings = None,
+                _ => record
+                    .resume_intents
+                    .push(record.paused_tasks[0].thread_id.clone()),
+            }
+            assert!(
+                !unsent_recovery_candidate(&record, "target"),
+                "case {changed}"
+            );
+        }
+    }
+
+    #[test]
+    fn partially_sent_recovery_can_continue_only_its_unsent_owned_tasks() {
+        let mut record = retry_record();
+        let mut second = record.paused_tasks[0].clone();
+        second.thread_id = "019ed000-2222-7222-8222-222222222222".into();
+        let mut planned = record.planned_tasks[0].clone();
+        planned.thread_id = second.thread_id.clone();
+        record.paused_tasks.push(second);
+        record.planned_tasks.push(planned);
+        record
+            .resume_intents
+            .push(record.paused_tasks[0].thread_id.clone());
+        assert!(unsent_recovery_candidate(&record, "target"));
+        assert!(!late_resume_candidate(&record, "target"));
+        record
+            .resume_intents
+            .push(record.paused_tasks[1].thread_id.clone());
+        assert!(!unsent_recovery_candidate(&record, "target"));
+        assert!(late_resume_candidate(&record, "target"));
+    }
+
+    #[test]
+    fn unsent_claim_preserves_operation_and_tickets_and_guards_outside_record_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = retry_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let guard = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        assert!(claim_unsent_recovery(&path, &before, 9, "target", &guard).unwrap());
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        let after = read_recovery_value(&path).unwrap();
+        assert_eq!(after["phase"], "recovering-saved-tasks");
+        assert_eq!(after["generation"], 9);
+        for field in [
+            "operationId",
+            "pausedTasks",
+            "plannedTasks",
+            "resumeIntents",
+            "reopenedPid",
+            "reopenedBirth",
+            "reopenedPort",
+        ] {
+            assert_eq!(after[field], before[field]);
+        }
+        assert!(!claim_unsent_recovery(&path, &before, 10, "target", &guard).unwrap());
+    }
+
+    #[test]
+    fn unsent_claim_never_revives_cancelled_or_newer_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = retry_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(
+            claim_unsent_recovery(&path, &before, 9, "target", &|| Err("cancelled".into()))
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let mut cancelled = before.clone();
+        cancelled["phase"] = json!("cancelled");
+        std::fs::write(&path, serde_json::to_vec(&cancelled).unwrap()).unwrap();
+        assert!(!claim_unsent_recovery(&path, &before, 9, "target", &|| Ok(())).unwrap());
+        assert!(!claim_unsent_recovery(&path, &cancelled, 9, "target", &|| Ok(())).unwrap());
+        assert_eq!(read_recovery_value(&path).unwrap(), cancelled);
+    }
+
+    #[test]
+    fn claimed_recovery_survives_guard_failure_without_a_permanent_stuck_phase() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = retry_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let guard = || {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("desktop temporarily unconfirmed".into())
+            }
+        };
+        assert!(claim_unsent_recovery(&path, &before, 9, "target", &guard).is_err());
+        let claimed = read_recovery_value(&path).unwrap();
+        assert_eq!(claimed["phase"], "recovering-saved-tasks");
+        assert!(unsent_recovery_candidate(
+            &read_record(&path).unwrap(),
+            "target"
+        ));
+        assert!(claim_unsent_recovery(&path, &claimed, 10, "target", &|| Ok(())).unwrap());
+        let after = read_recovery_value(&path).unwrap();
+        assert_eq!(after["operationId"], before["operationId"]);
+        assert_eq!(after["resumeIntents"], json!([]));
+    }
+
+    #[test]
+    fn crashed_resume_phases_reconcile_but_never_repeat_persisted_start_intents() {
+        for phase in [
+            "reopened",
+            "recovering-saved-tasks",
+            "resume-intent",
+            "resume-not-sent",
+            "resume-outcome-needs-review",
+            "resumed",
+        ] {
+            let mut record = retry_record();
+            record.phase = phase.into();
+            assert!(
+                unsent_recovery_candidate(&record, "target"),
+                "phase {phase}"
+            );
+            record
+                .resume_intents
+                .push(record.paused_tasks[0].thread_id.clone());
+            assert!(!unsent_recovery_candidate(&record, "target"));
+            assert!(late_resume_candidate(&record, "target"));
+        }
+        for phase in [
+            "close-intent",
+            "desktop-restarted",
+            "enabling",
+            "cancelled",
+            "superseded",
+            "completed",
+        ] {
+            let mut record = retry_record();
+            record.phase = phase.into();
+            assert!(
+                !unsent_recovery_candidate(&record, "target"),
+                "phase {phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn proven_unsent_error_releases_intent_but_uncertain_write_never_does() {
+        let mut record = sent_resume_record();
+        let id = record.paused_tasks[0].thread_id.clone();
+        let before = serde_json::to_value(&record).unwrap();
+        let uncertain = synthetic_read_error(SessionErrorKind::OutcomeUnknown, true);
+        assert!(!withdraw_proven_unsent_intent(&mut record, &id, &uncertain));
+        assert_eq!(serde_json::to_value(&record).unwrap(), before);
+        let not_sent = synthetic_read_error(SessionErrorKind::Unavailable, false);
+        assert!(withdraw_proven_unsent_intent(&mut record, &id, &not_sent));
+        assert!(record.resume_intents.is_empty());
+        assert_eq!(record.resume_not_sent_tasks, vec![id.clone()]);
+        assert!(withdraw_proven_unsent_intent(&mut record, &id, &not_sent));
+        assert_eq!(record.resume_not_sent_tasks, vec![id]);
+    }
+
+    #[test]
+    fn pending_description_reports_progress_without_generic_manual_restart_prompt() {
+        let record = serde_json::to_value(&retry_record()).unwrap();
+        let description = recovery_pending_description(&record);
+        assert!(description.contains("原任务 1 条"));
+        assert!(description.contains("已记录 0 条"));
+        assert!(description.contains("后台"));
+        assert!(!description.contains("手动启用"));
+        assert!(!description.contains("停止自动重放"));
     }
 
     fn late_confirmation(record: &RecoveryRecord) -> ResumeConfirmation {

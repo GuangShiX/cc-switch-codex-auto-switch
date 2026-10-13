@@ -559,6 +559,86 @@ impl DesktopSession {
         capture_saved_settings(metadata)
     }
 
+    /// Recheck an unsent persisted ticket against this desktop's live metadata.
+    /// Unlike the initial restart flow, a later retry must not restore over any
+    /// intervening user selections. This only reads the current owner snapshot.
+    pub fn can_retry_saved_task(
+        &self,
+        current: &TaskSnapshot,
+        paused: &PausedTask,
+    ) -> Result<(), SessionError> {
+        let changed = || {
+            SessionError::new(
+                SessionErrorKind::StateChanged,
+                "原聊天轮次、等待状态或用户设置已改变；不重试旧恢复任务",
+            )
+        };
+        let incomplete = || {
+            SessionError::new(
+                SessionErrorKind::Unknown,
+                "原聊天实时状态或设置尚未完整确认；稍后自动核对",
+            )
+        };
+        let invalid_saved = || {
+            SessionError::new(
+                SessionErrorKind::Blocked,
+                "原聊天保存的恢复设置不可用；未重试恢复",
+            )
+        };
+        let saved = paused.saved_settings.as_ref().ok_or_else(invalid_saved)?;
+        validate_saved_settings(saved).map_err(|_| invalid_saved())?;
+        if self.current_snapshot(&current.thread_id).as_ref() != Some(current) {
+            return Err(incomplete());
+        }
+        let actual = self
+            .saved_settings_for(&current.thread_id)
+            .map_err(|_| incomplete())?;
+        let metadata = &self
+            .states
+            .get(&current.thread_id)
+            .ok_or_else(incomplete)?
+            .metadata;
+        if current.turn_id.is_none()
+            || !matches!(
+                current.status.as_deref(),
+                Some("inProgress" | "interrupted" | "completed" | "failed")
+            )
+            || !matches!(
+                current.runtime_status.as_str(),
+                "active" | "idle" | "notLoaded" | "systemError"
+            )
+            || matches!(
+                current.waiting_reason,
+                Some(
+                    WaitingReason::UnknownRequest
+                        | WaitingReason::UnknownRuntimeFlag
+                        | WaitingReason::UnconfirmedTurnSubmission
+                )
+            )
+            || reopened_chat_is_loading(metadata, current, paused)
+        {
+            return Err(incomplete());
+        }
+        if !matches_reopened_pause(current, paused) {
+            return Err(changed());
+        }
+        let visualization_root = self
+            .trusted_codex_home
+            .as_deref()
+            .and_then(|home| trusted_visualization_root(home, &paused.thread_id));
+        if !resumed_model_settings_match(metadata, saved)
+            || !retry_saved_settings_match(
+                &actual,
+                saved,
+                visualization_root.as_deref(),
+                paused.context.cwd.as_deref(),
+            )
+        {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
     pub async fn wait_for_reopened_paused_chat<F>(
         &mut self,
         paused: &PausedTask,
@@ -1912,6 +1992,67 @@ fn resumed_model_settings_match(metadata: &Value, saved: &SavedTaskSettings) -> 
     effort_ok && mode_ok
 }
 
+fn retry_saved_settings_match(
+    actual: &SavedTaskSettings,
+    saved: &SavedTaskSettings,
+    visualization_root: Option<&str>,
+    original_cwd: Option<&str>,
+) -> bool {
+    let implicit_cwd = saved.thread_settings["cwd"].as_str().filter(|cwd| {
+        Some(*cwd) == original_cwd
+            && workspace_roots(&saved.current_permissions["runtimeWorkspaceRoots"])
+                .is_some_and(|roots| roots.contains(&normalized_workspace_root(cwd)))
+    });
+    let policy_fields_match = |current: &Value, expected: &Value| {
+        current["approvalPolicy"] == expected["approvalPolicy"]
+            && current["approvalsReviewer"] == expected["approvalsReviewer"]
+            && current["activePermissionProfile"]["id"] == expected["activePermissionProfile"]["id"]
+            && resumed_sandbox_policy_match(
+                &current["sandboxPolicy"],
+                &expected["sandboxPolicy"],
+                visualization_root,
+                implicit_cwd,
+            )
+    };
+    if !policy_fields_match(&actual.thread_settings, &saved.thread_settings)
+        || !policy_fields_match(&actual.current_permissions, &saved.current_permissions)
+        || (actual.current_permissions["runtimeWorkspaceRoots"]
+            != saved.current_permissions["runtimeWorkspaceRoots"]
+            && !resumed_workspace_roots_match(
+                &actual.current_permissions["runtimeWorkspaceRoots"],
+                &saved.current_permissions["runtimeWorkspaceRoots"],
+                visualization_root,
+            ))
+    {
+        return false;
+    }
+    let comparable_preferences = |settings: &Value| {
+        let mut preferences = settings.as_object()?.clone();
+        for key in [
+            "approvalPolicy",
+            "approvalsReviewer",
+            "sandboxPolicy",
+            "activePermissionProfile",
+            "permissions",
+        ] {
+            preferences.remove(key);
+        }
+        // Mode-specific effort is the effective selection; the native desktop
+        // may clear the redundant flat effort field after hydration.
+        if settings["collaborationMode"].is_object() {
+            preferences.insert(
+                "effort".into(),
+                settings["collaborationMode"]["settings"]["reasoning_effort"].clone(),
+            );
+        } else if settings["collaborationMode"].is_null() {
+            preferences.remove("collaborationMode");
+        }
+        Some(preferences)
+    };
+    comparable_preferences(&actual.thread_settings)
+        == comparable_preferences(&saved.thread_settings)
+}
+
 #[cfg(test)]
 fn effective_permissions_match(
     current: &Value,
@@ -3176,6 +3317,280 @@ mod tests {
             compatible: true,
             broken: false,
         }
+    }
+
+    fn saved_retry_state(value: &Value) -> (DesktopSession, TaskSnapshot) {
+        let metadata = project_at(&[], value).unwrap();
+        let task = summarize(&metadata, "new-owner").unwrap();
+        let mut session = fake_session();
+        session.states.insert(
+            task.thread_id.clone(),
+            TrackedState {
+                owner: task.owner.clone(),
+                revision: json!(1),
+                metadata,
+            },
+        );
+        (session, task)
+    }
+
+    #[test]
+    fn saved_retry_requires_owned_stopped_turn_and_current_live_snapshot() {
+        let original = state("interrupted");
+        let mut ticket = paused();
+        ticket.saved_settings = Some(capture_saved_settings(&original).unwrap());
+        let (session, current) = saved_retry_state(&original);
+        assert!(session.can_retry_saved_task(&current, &ticket).is_ok());
+        let mut unowned = ticket.clone();
+        unowned.confirmed_by_cc_switch = false;
+        assert!(session.can_retry_saved_task(&current, &unowned).is_err());
+        unowned = ticket.clone();
+        unowned.saved_settings = None;
+        assert_eq!(
+            session
+                .can_retry_saved_task(&current, &unowned)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Blocked
+        );
+        unowned = ticket.clone();
+        unowned.saved_settings.as_mut().unwrap().thread_settings["model"] =
+            json!({"unknown":"format"});
+        assert_eq!(
+            session
+                .can_retry_saved_task(&current, &unowned)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Blocked
+        );
+        let mut stale = current.clone();
+        stale.owner = "old-owner".into();
+        assert_eq!(
+            session
+                .can_retry_saved_task(&stale, &ticket)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Unknown
+        );
+        let mut no_metadata = fake_session();
+        assert_eq!(
+            no_metadata
+                .can_retry_saved_task(&current, &ticket)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Unknown
+        );
+        no_metadata.states.insert(
+            current.thread_id.clone(),
+            TrackedState {
+                owner: current.owner.clone(),
+                revision: json!(1),
+                metadata: json!({}),
+            },
+        );
+        assert_eq!(
+            no_metadata
+                .can_retry_saved_task(&current, &ticket)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Unknown
+        );
+        let mut malformed = original.clone();
+        malformed["latestThreadSettings"]["model"] = json!({"unknown":"format"});
+        let (session, malformed_current) = saved_retry_state(&malformed);
+        assert_eq!(
+            session
+                .can_retry_saved_task(&malformed_current, &ticket)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Unknown
+        );
+        malformed = original.clone();
+        malformed["threadRuntimeStatus"]["type"] = json!("unknown");
+        let (session, loading_current) = saved_retry_state(&malformed);
+        assert_eq!(
+            session
+                .can_retry_saved_task(&loading_current, &ticket)
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::Unknown
+        );
+
+        for change in [
+            "turn",
+            "completed",
+            "running",
+            "approval",
+            "model",
+            "provider",
+            "cwd",
+        ] {
+            let mut value = original.clone();
+            match change {
+                "turn" => value["turns"][0]["turnId"] = json!("user-new-turn"),
+                "completed" => value["turns"][0]["status"] = json!("completed"),
+                "running" => {
+                    value["turns"][0]["status"] = json!("inProgress");
+                    value["threadRuntimeStatus"]["type"] = json!("active");
+                }
+                "approval" => {
+                    value["requests"] = json!([{"method":"item/commandExecution/requestApproval","params":{"turnId":"original-turn"}}])
+                }
+                "model" => {
+                    value["latestModel"] = json!("user-model");
+                    value["latestThreadSettings"]["model"] = json!("user-model");
+                }
+                "provider" => value["modelProvider"] = json!("user-provider"),
+                _ => {
+                    value["cwd"] = json!("C:/user-project");
+                    value["latestThreadSettings"]["cwd"] = json!("C:/user-project");
+                }
+            }
+            let (session, current) = saved_retry_state(&value);
+            let error = session.can_retry_saved_task(&current, &ticket).unwrap_err();
+            assert_eq!(error.kind, SessionErrorKind::StateChanged, "{change}");
+            assert!(!error.mutation_may_have_been_sent);
+            assert!(session.mutation_attempts.is_empty());
+        }
+
+        let ticket = quota_ticket();
+        let mut reopened = quota_failed_state();
+        reopened["turns"][0]["durationMs"] = json!(9_495);
+        let (session, current) = saved_retry_state(&reopened);
+        assert!(session.can_retry_saved_task(&current, &ticket).is_ok());
+        reopened["turns"][0]["error"]["codexErrorInfo"] = json!("other");
+        let (session, current) = saved_retry_state(&reopened);
+        assert!(session.can_retry_saved_task(&current, &ticket).is_err());
+    }
+
+    #[test]
+    fn saved_retry_checks_all_user_preferences_and_permission_selections() {
+        let mut original = state("interrupted");
+        for (key, value) in [
+            ("serviceTier", json!("default")),
+            ("summary", json!("auto")),
+            ("personality", json!("friendly")),
+            ("multiAgentMode", json!("default")),
+            ("disabledPluginIds", json!(["original-plugin"])),
+        ] {
+            original["latestThreadSettings"][key] = value;
+        }
+        let mut ticket = paused();
+        ticket.saved_settings = Some(capture_saved_settings(&original).unwrap());
+        let (session, current) = saved_retry_state(&original);
+        assert!(session.can_retry_saved_task(&current, &ticket).is_ok());
+        for (key, value) in [
+            ("serviceTier", json!("priority")),
+            ("summary", json!("detailed")),
+            ("personality", json!("user-selection")),
+            ("multiAgentMode", json!("off")),
+            ("disabledPluginIds", json!(["other-plugin"])),
+            ("approvalPolicy", json!("never")),
+            ("approvalsReviewer", json!("auto")),
+            ("activePermissionProfile", json!({"id":"other"})),
+            ("sandboxPolicy", json!({"type":"dangerFullAccess"})),
+        ] {
+            let mut value_state = original.clone();
+            value_state["latestThreadSettings"][key] = value;
+            let (session, current) = saved_retry_state(&value_state);
+            assert!(
+                session.can_retry_saved_task(&current, &ticket).is_err(),
+                "{key}"
+            );
+        }
+        for changed in [
+            "effort",
+            "mode",
+            "developer-instructions",
+            "permission-roots",
+            "network",
+        ] {
+            let mut value = original.clone();
+            match changed {
+                "effort" => {
+                    value["latestThreadSettings"]["collaborationMode"]["settings"]
+                        ["reasoning_effort"] = json!("low");
+                    value["latestCollaborationMode"]["settings"]["reasoning_effort"] = json!("low");
+                }
+                "mode" => {
+                    value["latestThreadSettings"]["collaborationMode"]["mode"] = json!("plan");
+                    value["latestCollaborationMode"]["mode"] = json!("plan");
+                }
+                "developer-instructions" => {
+                    value["latestThreadSettings"]["collaborationMode"]["settings"]
+                        ["developer_instructions"] = json!("user-private-choice")
+                }
+                "permission-roots" => {
+                    value["currentPermissions"]["runtimeWorkspaceRoots"] =
+                        json!(["C:/project", "C:/other"])
+                }
+                _ => value["currentPermissions"]["sandboxPolicy"]["networkAccess"] = json!(true),
+            }
+            let (session, current) = saved_retry_state(&value);
+            assert!(
+                session.can_retry_saved_task(&current, &ticket).is_err(),
+                "{changed}"
+            );
+        }
+        let mut hydrated = original;
+        hydrated["latestThreadSettings"]["effort"] = Value::Null;
+        hydrated["latestReasoningEffort"] = Value::Null;
+        let (session, current) = saved_retry_state(&hydrated);
+        assert!(session.can_retry_saved_task(&current, &ticket).is_ok());
+    }
+
+    #[test]
+    fn saved_retry_normalizes_only_trusted_native_root_materialization() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019b8127-5c18-7000-8000-000000000001";
+        let own = trusted_visualization_root(home.path(), thread).unwrap();
+        let mut original = state("interrupted");
+        original["id"] = json!(thread);
+        for section in ["latestThreadSettings", "currentPermissions"] {
+            original[section]["sandboxPolicy"]["writableRoots"] = json!(["C:/data"]);
+            original[section]["activePermissionProfile"] =
+                json!({"id":"original","extends":"base"});
+        }
+        let (_, initial) = saved_retry_state(&original);
+        let ticket = PausedTask {
+            thread_id: thread.into(),
+            context: initial.context,
+            saved_settings: Some(capture_saved_settings(&original).unwrap()),
+            ..paused()
+        };
+        let mut hydrated = original.clone();
+        for section in ["latestThreadSettings", "currentPermissions"] {
+            hydrated[section]["sandboxPolicy"]["writableRoots"] =
+                json!(["C:\\data\\", "C:/project", own]);
+            hydrated[section]["activePermissionProfile"]["extends"] = Value::Null;
+        }
+        hydrated["currentPermissions"]["runtimeWorkspaceRoots"] =
+            json!(["C:/project/", "C:/project", own]);
+        let (mut session, current) = saved_retry_state(&hydrated);
+        session.set_trusted_codex_home(home.path().into());
+        assert!(session.can_retry_saved_task(&current, &ticket).is_ok());
+        session.trusted_codex_home = None;
+        assert!(session.can_retry_saved_task(&current, &ticket).is_err());
+        for section in ["latestThreadSettings", "currentPermissions"] {
+            let mut changed = hydrated.clone();
+            changed[section]["sandboxPolicy"]["writableRoots"] =
+                json!(["C:/data", "C:/project", own, "C:/other"]);
+            let (mut session, current) = saved_retry_state(&changed);
+            session.set_trusted_codex_home(home.path().into());
+            assert!(session.can_retry_saved_task(&current, &ticket).is_err());
+        }
+        let mut unauthorized = ticket.clone();
+        unauthorized
+            .saved_settings
+            .as_mut()
+            .unwrap()
+            .current_permissions["runtimeWorkspaceRoots"] = json!(["C:/data"]);
+        let (mut session, current) = saved_retry_state(&hydrated);
+        session.set_trusted_codex_home(home.path().into());
+        assert!(session
+            .can_retry_saved_task(&current, &unauthorized)
+            .is_err());
+        assert!(session.mutation_attempts.is_empty());
     }
 
     #[test]
