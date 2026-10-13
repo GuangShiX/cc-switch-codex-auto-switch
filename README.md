@@ -63,6 +63,8 @@ Windows PowerShell 操作使用 PowerShell 7。此分支已关闭上游自动更
 
 Windows 下 Debug 和 Release 程序均不弹出控制台窗口，日志仍写入本地配置目录的 `logs/cc-switch.log`。设置中的“静默启动”可让主界面直接隐藏到托盘，后台监测照常运行。
 
+从 Codex 的命令工具安装或启动 CC Switch 时，使用 PowerShell 7 调用 `scripts/Start-CCSwitchIndependent.ps1`；自定义安装目录可传入 `-ExecutablePath`。脚本委托当前 Explorer 桌面启动，并核对目标路径、进程出生时间和 Explorer 父进程，使后台管理器独立于启动命令的生命周期。准确的同路径实例已经运行时保留该实例，不重复启动。直接从工具进程调用 `Start-Process` 可能继承宿主的 Windows Job，导致 Codex 退出清理时 CC Switch 也结束；结果未确认时不要盲目重启。正常从开始菜单打开 CC Switch 仍可照常使用。
+
 ## 账号及隐私
 
 账号仍由 CC Switch 现有本地托管账号与供应商服务管理；本改造不清空数据库、不要求逐个重新登录，也不依赖旧自动换号插件或模型调用切号工具。
