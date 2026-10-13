@@ -283,7 +283,7 @@ pub fn pending_recovery_reason() -> Option<String> {
     None
 }
 
-fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
+fn confirmed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
     if record.phase != "needs-review"
         || record.target_provider_id != current
         || !record.desktop_restarted
@@ -293,16 +293,26 @@ fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
         || record.reopened_port.is_none()
         || record.wait_until.is_some()
         || record.paused_tasks.is_empty()
-        || !record.resume_intents.is_empty()
-        || !record.settings_restore_intents.is_empty()
-        || !record.settings_restored_tasks.is_empty()
-        || !record.resumed_tasks.is_empty()
-        || !record.resume_confirmations.is_empty()
-        || record.planned_tasks.len() != record.paused_tasks.len()
+        || record.planned_tasks.len() != record.paused_tasks.len() + record.abandoned_tasks.len()
+    {
+        return false;
+    }
+    let mut planned_ids = std::collections::HashSet::new();
+    if !record
+        .planned_tasks
+        .iter()
+        .all(|task| planned_ids.insert(&task.thread_id))
     {
         return false;
     }
     let mut ids = std::collections::HashSet::new();
+    if !record
+        .abandoned_tasks
+        .iter()
+        .all(|id| planned_ids.contains(id) && ids.insert(id))
+    {
+        return false;
+    }
     record.paused_tasks.iter().all(|saved| {
         if saved.pause_operation_id != record.operation_id || !ids.insert(&saved.thread_id) {
             return false;
@@ -330,6 +340,49 @@ fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
             codex_desktop_session::RecoveryOrigin::QuotaExhausted => planned.matches_paused(saved),
         }
     })
+}
+
+#[cfg(test)]
+fn obsolete_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
+    confirmed_recovery_candidate(record, current)
+        && record.resume_intents.is_empty()
+        && record.settings_restore_intents.is_empty()
+        && record.settings_restored_tasks.is_empty()
+        && record.resumed_tasks.is_empty()
+        && record.resume_confirmations.is_empty()
+}
+
+fn late_resume_candidate(record: &RecoveryRecord, current: &str) -> bool {
+    // Mark completed only when every owned chat has exactly one persisted
+    // intent and that exact operation's new turn is observed. Partial flows
+    // may be superseded by proven user changes, never started from here.
+    changed_recovery_candidate(record, current)
+        && record.resume_intents.len() == record.paused_tasks.len()
+}
+
+fn changed_recovery_candidate(record: &RecoveryRecord, current: &str) -> bool {
+    let mut intents = std::collections::HashSet::new();
+    confirmed_recovery_candidate(record, current)
+        && record.settings_restore_intents.is_empty()
+        && record.resume_intents.iter().all(|id| {
+            intents.insert(id)
+                && record
+                    .paused_tasks
+                    .iter()
+                    .any(|saved| saved.thread_id == *id)
+        })
+        && record
+            .resumed_tasks
+            .iter()
+            .all(|id| record.resume_intents.contains(id))
+        && record
+            .settings_restored_tasks
+            .iter()
+            .all(|id| record.resume_intents.contains(id))
+        && record.resume_confirmations.iter().all(|confirmation| {
+            confirmation.operation_id == record.operation_id
+                && record.resume_intents.contains(&confirmation.thread_id)
+        })
 }
 
 fn saved_task_was_changed(saved: &PausedTask, actual: &TaskSnapshot) -> bool {
@@ -379,15 +432,20 @@ fn all_saved_tasks_were_changed(record: &RecoveryRecord, inventory: &TaskInvento
                 .chain(inventory.blocked.iter())
                 .filter(|task| task.thread_id == saved.thread_id);
             matches.next().is_some_and(|actual| {
-                matches.next().is_none() && saved_task_was_changed(saved, actual)
+                matches.next().is_none()
+                    // Our own unconfirmed new turn is not a user choice. In
+                    // particular a model/permission mismatch must stay visible,
+                    // rather than being discarded as an obsolete pause.
+                    && actual.client_user_message_id.as_deref() != Some(record.operation_id.as_str())
+                    && saved_task_was_changed(saved, actual)
             })
         })
 }
 
-/// A failed restoration with no sent continuation is obsolete only once every
-/// owned ticket has demonstrably been continued/changed by the user. This reads
-/// the existing desktop and commits a journal terminal state; it never starts,
-/// interrupts, navigates, activates an account or repeats an uncertain action.
+/// Read-only settlement of failed restoration. Unsent tickets become obsolete
+/// after proven user changes. Sent intents complete only after observing every
+/// exact operation's new turn with the saved model/project/permissions. This
+/// never starts, interrupts, navigates, activates or repeats uncertain actions.
 pub async fn reconcile_obsolete_recovery(
     app: &tauri::AppHandle,
     generation: u64,
@@ -416,7 +474,8 @@ pub async fn reconcile_obsolete_recovery(
             continue;
         }
         let record = read_record(&path)?;
-        if !obsolete_recovery_candidate(&record, current) {
+        let late_resume = late_resume_candidate(&record, current);
+        if !changed_recovery_candidate(&record, current) {
             continue;
         }
         let receipt = receipt_for_wait(&record)?;
@@ -433,6 +492,27 @@ pub async fn reconcile_obsolete_recovery(
         let expected = current_login_identity(app, current).await?;
         guard()?;
         confirm_identity_receipt(&expected, &receipt, &guard).await?;
+        if late_resume {
+            let mut session = connect_reopened_desktop(&guard).await?;
+            let mut confirmations = Vec::new();
+            for saved in &record.paused_tasks {
+                guard()?;
+                match session.reconcile_resume(saved, &record.operation_id).await {
+                    Ok(confirmation) => confirmations.push(confirmation),
+                    Err(_) => break, // Still uncertain; no start or other mutation.
+                }
+            }
+            guard()?;
+            if confirmations.len() == record.paused_tasks.len() {
+                confirm_identity_receipt(&expected, &receipt, &guard).await?;
+                if complete_late_recovery(&path, &value, &confirmations, guard.as_ref())? {
+                    reconciled += 1;
+                }
+                continue;
+            }
+            // A later user turn can supersede a previously sent intent too.
+            // Verify all owned tasks below before discarding any old plan.
+        }
         let (_session, inventory) = snapshot_original_desktop(guard.as_ref()).await?;
         if !all_saved_tasks_were_changed(&record, &inventory) {
             continue;
@@ -485,13 +565,60 @@ async fn current_login_identity(
     Ok(expected)
 }
 
+fn complete_late_recovery(
+    path: &std::path::Path,
+    expected: &serde_json::Value,
+    confirmations: &[ResumeConfirmation],
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<bool, String> {
+    let _record_lock = RECORD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard()?;
+    let mut value = read_recovery_value(path)?;
+    if value != *expected {
+        return Ok(false);
+    }
+    let record = read_record(path)?;
+    if !late_resume_candidate(&record, &record.target_provider_id)
+        || confirmations.len() != record.paused_tasks.len()
+        || !record.paused_tasks.iter().all(|saved| {
+            let mut matching = confirmations
+                .iter()
+                .filter(|item| item.thread_id == saved.thread_id);
+            matching.next().is_some_and(|item| {
+                item.operation_id == record.operation_id
+                    && !item.turn_id.is_empty()
+                    && item.turn_id != saved.turn_id
+                    && item.already_observed
+                    && matching.next().is_none()
+            })
+        })
+    {
+        return Ok(false);
+    }
+    let ids: Vec<_> = record
+        .paused_tasks
+        .iter()
+        .map(|saved| &saved.thread_id)
+        .collect();
+    value["phase"] = serde_json::json!("completed");
+    value["resumeConfirmations"] =
+        serde_json::to_value(confirmations).map_err(|_| "无法保存已确认的原聊天恢复结果")?;
+    value["resumedTasks"] = serde_json::json!(ids);
+    value["settingsRestoredTasks"] = serde_json::json!(ids);
+    value["settlementReason"] =
+        serde_json::json!("只读核对已确认本次恢复的新轮次及原模型、项目和权限；未重复发送继续");
+    commit_recovery_value(path, &value, guard)?;
+    Ok(true)
+}
+
 fn supersede_obsolete_recovery(
     path: &std::path::Path,
     expected: &serde_json::Value,
     saved: &[PausedTask],
     guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
 ) -> Result<bool, String> {
-    use std::io::Write;
     let _record_lock = RECORD_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -518,6 +645,16 @@ fn supersede_obsolete_recovery(
     value["supersededReason"] = serde_json::json!(
         "只读核对确认本次保存的原任务均已被继续、完成或等待用户处理；旧计划失效，未重放任何操作"
     );
+    commit_recovery_value(path, &value, guard)?;
+    Ok(true)
+}
+
+fn commit_recovery_value(
+    path: &std::path::Path,
+    value: &serde_json::Value,
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+) -> Result<(), String> {
+    use std::io::Write;
     let encoded = serde_json::to_vec(&value).map_err(|_| "无法编码旧恢复记录终态")?;
     if encoded.len() > 1_048_576 {
         return Err("旧恢复记录终态超出安全读取上限；保持原记录待处理".into());
@@ -532,7 +669,7 @@ fn supersede_obsolete_recovery(
         .map_err(|_| "无法同步旧恢复记录终态")?;
     guard()?;
     file.persist(path).map_err(|_| "无法提交旧恢复记录终态")?;
-    Ok(true)
+    Ok(())
 }
 
 /// Capture existing journal paths before invalidating the user's operation.
@@ -849,7 +986,9 @@ fn matches_wait_baseline(
     baseline: &TaskSnapshot,
     saved: &PausedTask,
 ) -> bool {
-    current.thread_id == saved.thread_id
+    baseline.thread_id == saved.thread_id
+        && baseline.turn_id.as_deref() == Some(saved.turn_id.as_str())
+        && current.thread_id == saved.thread_id
         && current.turn_id.as_deref() == Some(saved.turn_id.as_str())
         && current.context == baseline.context
         && !current.waiting
@@ -857,7 +996,13 @@ fn matches_wait_baseline(
         && !current.ephemeral
         && match saved.origin {
             codex_desktop_session::RecoveryOrigin::QuotaExhausted => {
-                current.safely_quota_failed() && current.turn_ended_at_ms == saved.turn_ended_at_ms
+                // Loading the persisted turn reconstructs its duration. The
+                // original timestamp established freshness before restart;
+                // subsequent waiting checks use the confirmed reopened value.
+                current.safely_quota_failed()
+                    && saved.turn_ended_at_ms.is_some()
+                    && baseline.turn_ended_at_ms.is_some()
+                    && current.turn_ended_at_ms == baseline.turn_ended_at_ms
             }
             codex_desktop_session::RecoveryOrigin::CcSwitchPause => {
                 current.safely_idle() && current.status.as_deref() == Some("interrupted")
@@ -967,6 +1112,10 @@ pub async fn resume_quota_reset_wait(
         }
     }
     record.paused_tasks = eligible;
+    // This has left the reset-wait phase. Keep the baselines and abandoned
+    // tickets for audit, but allow late confirmation of the ensuing starts.
+    record.wait_until = None;
+    record.waiting_account_id = None;
     // Refresh only the generation. Original operation UUID and task tickets
     // remain unchanged across hours of waiting and CC Switch restarts.
     record.generation = generation;
@@ -1419,90 +1568,175 @@ async fn resume_saved_tasks(
         "resuming",
         "正在恢复本次记录的原聊天，沿用原模型和权限",
     );
-    for paused in record.paused_tasks.clone() {
-        resume_guard()?;
-        if let Some(expected) = expected_identity {
-            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+    let tasks = record.paused_tasks.clone();
+    let mut context = SavedTaskRecovery {
+        app,
+        generation,
+        record,
+        resume_guard: resume_guard.clone(),
+        expected_identity,
+        navigation_receipt,
+    };
+    recover_tasks_independently(
+        &tasks,
+        &mut context,
+        resume_guard.as_ref(),
+        |context, paused| {
+            Box::pin(async move {
+                let result = resume_saved_task(context, paused).await;
+                if result.is_err() {
+                    context.record.phase = "resume-outcome-needs-review".into();
+                    context.record.persist()?;
+                }
+                result
+            })
+        },
+    )
+    .await
+}
+
+struct SavedTaskRecovery<'a> {
+    app: &'a tauri::AppHandle,
+    generation: u64,
+    record: &'a mut RecoveryRecord,
+    resume_guard: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    expected_identity: Option<&'a DesktopIdentity>,
+    navigation_receipt: restart::IdentityReceipt,
+}
+
+/// A failed/uncertain first chat must not prevent other independently owned
+/// pauses from being restored. Each task checks its fresh state and sends at
+/// most once. Cancellation/account/process changes still stop the whole flow.
+async fn recover_tasks_independently<C, Recover>(
+    tasks: &[PausedTask],
+    context: &mut C,
+    guard: &(dyn Fn() -> Result<(), String> + Send + Sync),
+    mut recover: Recover,
+) -> Result<(), String>
+where
+    Recover: for<'a> FnMut(
+        &'a mut C,
+        &'a PausedTask,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>,
+    >,
+{
+    let mut failures = Vec::new();
+    for (index, task) in tasks.iter().enumerate() {
+        guard()?;
+        if let Err(error) = recover(context, task).await {
+            guard()?;
+            failures.push(format!("第 {} 条：{error}", index + 1));
         }
-        // Subscribe before navigation so the original owner registering
-        // during startup cannot be missed by a one-shot subscription.
-        let mut session = connect_reopened_desktop(&resume_guard).await?;
-        session
-            .begin_follow(&paused.thread_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        codex_desktop_session::open_original_chat(&paused.thread_id).map_err(|e| e.to_string())?;
-        restart::wait_for_navigation(&navigation_receipt, guard.as_ref()).await?;
-        if let Some(expected) = expected_identity {
-            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+    }
+    guard()?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "原聊天恢复确认 {}/{} 条；{}；已分别核对其余聊天，未重复发送继续",
+            tasks.len() - failures.len(),
+            tasks.len(),
+            failures.join("；")
+        ))
+    }
+}
+
+async fn resume_saved_task(
+    context: &mut SavedTaskRecovery<'_>,
+    paused: &PausedTask,
+) -> Result<(), String> {
+    let app = context.app;
+    let generation = context.generation;
+    let record = &mut *context.record;
+    let resume_guard = context.resume_guard.clone();
+    let expected_identity = context.expected_identity;
+    let navigation_receipt = context.navigation_receipt.clone();
+    resume_guard()?;
+    if let Some(expected) = expected_identity {
+        confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+    }
+    // Subscribe before navigation so the original owner registering
+    // during startup cannot be missed by a one-shot subscription.
+    let mut session = connect_reopened_desktop(&resume_guard).await?;
+    session
+        .begin_follow(&paused.thread_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    codex_desktop_session::open_original_chat(&paused.thread_id).map_err(|e| e.to_string())?;
+    restart::wait_for_navigation(&navigation_receipt, resume_guard.as_ref()).await?;
+    if let Some(expected) = expected_identity {
+        confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+    }
+    monitor::lifecycle_status(
+        &app,
+        generation,
+        "waiting-for-chat",
+        "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
+    );
+    let actual = session
+        .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
+        .await
+        .map_err(|e| e.to_string())?;
+    if !record.wait_baselines.is_empty() {
+        let baseline = record
+            .wait_baselines
+            .iter()
+            .find(|task| task.thread_id == paused.thread_id)
+            .ok_or("额度等待任务缺少原设置基线；未继续")?;
+        if actual.context != baseline.context {
+            return Err("等待期间原任务的项目、模型或权限已被用户修改；未覆盖用户设置".into());
         }
-        monitor::lifecycle_status(
-            &app,
-            generation,
-            "waiting-for-chat",
-            "正在等待原聊天加载并核对本次记录的轮次，尚未发送继续",
-        );
-        let actual = session
-            .wait_for_reopened_paused_chat(&paused, || resume_guard().is_ok())
-            .await
-            .map_err(|e| e.to_string())?;
-        if !record.wait_baselines.is_empty() {
-            let baseline = record
-                .wait_baselines
-                .iter()
-                .find(|task| task.thread_id == paused.thread_id)
-                .ok_or("额度等待任务缺少原设置基线；未继续")?;
-            if actual.context != baseline.context {
-                return Err("等待期间原任务的项目、模型或权限已被用户修改；未覆盖用户设置".into());
-            }
-        }
-        monitor::lifecycle_status(
-            &app,
-            generation,
-            "resuming",
-            "正在用原聊天恢复请求继续任务，保留本次换号前的模型和权限",
-        );
-        if let Some(expected) = expected_identity {
-            confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
-        }
-        // Persist the unique intent before sending once. A crash/timeout
-        // leaves a needs-review record; startup never replays continuation.
-        record.phase = "resume-intent".into();
-        record.resume_intents.push(paused.thread_id.clone());
-        record.persist()?;
-        let resume = session
-            .resume_and_confirm(&paused, &record.operation_id, || resume_guard().is_ok())
-            .await;
-        let confirmation = match resume {
-            Ok(confirmation) => confirmation,
-            Err(error) => {
-                // Reconciliation reads the new turn; it never repeats start.
-                match session
-                    .reconcile_resume(&paused, &record.operation_id)
-                    .await
-                {
-                    Ok(confirmation) => confirmation,
-                    Err(_) => {
-                        record.phase = "resume-outcome-needs-review".into();
-                        record.persist()?;
-                        return Err(format!(
-                            "账号已启用且桌面已重开，但原聊天恢复未确认：{error}；未重复继续"
-                        ));
-                    }
+    }
+    monitor::lifecycle_status(
+        &app,
+        generation,
+        "resuming",
+        "正在用原聊天恢复请求继续任务，保留本次换号前的模型和权限",
+    );
+    if let Some(expected) = expected_identity {
+        confirm_identity_receipt(expected, &navigation_receipt, &resume_guard).await?;
+    }
+    // Persist the unique intent before sending once. A crash/timeout
+    // leaves a needs-review record; startup never replays continuation.
+    record.phase = "resume-intent".into();
+    if record.resume_intents.contains(&paused.thread_id) {
+        return Err("此聊天已有本次恢复意图；未重复发送继续".into());
+    }
+    record.resume_intents.push(paused.thread_id.clone());
+    record.persist()?;
+    let resume = session
+        .resume_and_confirm(&paused, &record.operation_id, || resume_guard().is_ok())
+        .await;
+    let confirmation = match resume {
+        Ok(confirmation) => confirmation,
+        Err(error) => {
+            // Reconciliation reads the new turn; it never repeats start.
+            match session
+                .reconcile_resume(&paused, &record.operation_id)
+                .await
+            {
+                Ok(confirmation) => confirmation,
+                Err(_) => {
+                    record.phase = "resume-outcome-needs-review".into();
+                    record.persist()?;
+                    return Err(format!(
+                        "账号已启用且桌面已重开，但原聊天恢复未确认：{error}；未重复继续"
+                    ));
                 }
             }
-        };
-        record.resume_confirmations.push(confirmation);
-        // The single original resume request resolves these settings as
-        // part of starting its new turn. Record them only after the live
-        // new turn's model, project and permission semantics are confirmed.
-        record
-            .settings_restored_tasks
-            .push(paused.thread_id.clone());
-        record.resumed_tasks.push(paused.thread_id.clone());
-        record.phase = "resumed".into();
-        record.persist()?;
-    }
+        }
+    };
+    record.resume_confirmations.push(confirmation);
+    // The single original resume request resolves these settings as
+    // part of starting its new turn. Record them only after the live
+    // new turn's model, project and permission semantics are confirmed.
+    record
+        .settings_restored_tasks
+        .push(paused.thread_id.clone());
+    record.resumed_tasks.push(paused.thread_id.clone());
+    record.phase = "resumed".into();
+    record.persist()?;
     Ok(())
 }
 
@@ -1580,6 +1814,7 @@ async fn snapshot_original_desktop(
         )?;
         guard().map_err(guard_error)?;
         let mut session = DesktopSession::connect().await?;
+        session.set_trusted_codex_home(crate::codex_config::get_codex_config_dir());
         guard().map_err(guard_error)?;
         let mut inventory = session.snapshot_safe_running_tasks(&ids).await?;
         inventory.candidate_coverage_complete = true;
@@ -1858,6 +2093,62 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    async fn first_chat_confirmation_failure_does_not_skip_second_owned_pause() {
+        let first = paused(&original_task());
+        let mut second = first.clone();
+        second.thread_id = "019ed000-2222-7222-8222-222222222222".into();
+        let tasks = vec![first.clone(), second.clone()];
+        let mut attempts = Vec::new();
+        let result =
+            recover_tasks_independently(&tasks, &mut attempts, &|| Ok(()), |attempts, task| {
+                Box::pin(async move {
+                    attempts.push(task.thread_id.clone());
+                    if attempts.len() == 1 {
+                        Err("synthetic uncertain first request".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(attempts, vec![first.thread_id, second.thread_id]);
+        assert!(result.contains("1/2"));
+        assert!(result.contains("第 1 条"));
+        assert!(result.contains("未重复发送继续"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_first_uncertain_resume_stops_other_tasks_without_retry() {
+        let task = paused(&original_task());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let guard = || {
+            if cancelled.load(Ordering::SeqCst) {
+                Err("cancelled generation".into())
+            } else {
+                Ok(())
+            }
+        };
+        let mut attempts = (0, cancelled.clone());
+        let error = recover_tasks_independently(
+            &[task.clone(), task],
+            &mut attempts,
+            &guard,
+            |attempts, _| {
+                Box::pin(async move {
+                    attempts.0 += 1;
+                    attempts.1.store(true, Ordering::SeqCst);
+                    Err("synthetic uncertain result".into())
+                })
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attempts.0, 1);
+        assert_eq!(error, "cancelled generation");
+    }
+
     fn paused(task: &TaskSnapshot) -> PausedTask {
         serde_json::from_value(json!({"threadId":task.thread_id,"turnId":task.turn_id,
             "context":task.context,"pauseOperationId":"operation-A","confirmedByCcSwitch":true}))
@@ -1927,6 +2218,178 @@ mod tests {
                 "case {changed}"
             );
         }
+    }
+
+    fn sent_resume_record() -> RecoveryRecord {
+        let mut record = obsolete_record();
+        record
+            .resume_intents
+            .push(record.paused_tasks[0].thread_id.clone());
+        record
+    }
+
+    fn late_confirmation(record: &RecoveryRecord) -> ResumeConfirmation {
+        ResumeConfirmation {
+            thread_id: record.paused_tasks[0].thread_id.clone(),
+            turn_id: "confirmed-new-turn".into(),
+            operation_id: record.operation_id.clone(),
+            already_observed: true,
+        }
+    }
+
+    #[test]
+    fn late_resume_requires_exactly_one_sent_intent_for_every_owned_task() {
+        assert!(late_resume_candidate(&sent_resume_record(), "target"));
+        assert!(!obsolete_recovery_candidate(
+            &sent_resume_record(),
+            "target"
+        ));
+        for changed in 0..8 {
+            let mut record = sent_resume_record();
+            match changed {
+                0 => record.resume_intents.clear(),
+                1 => record.resume_intents.push(record.resume_intents[0].clone()),
+                2 => record.resume_intents[0] = "unrelated".into(),
+                3 => record
+                    .settings_restore_intents
+                    .push("unconfirmed-setting-edit".into()),
+                4 => record.resumed_tasks.push("unrelated".into()),
+                5 => record.settings_restored_tasks.push("unrelated".into()),
+                6 => {
+                    let mut confirmation = late_confirmation(&record);
+                    confirmation.operation_id = "different-operation".into();
+                    record.resume_confirmations.push(confirmation);
+                }
+                _ => record.runtime_identity_confirmed = false,
+            }
+            assert!(!late_resume_candidate(&record, "target"), "case {changed}");
+        }
+    }
+
+    #[test]
+    fn late_resume_settlement_preserves_intent_and_unknown_fields_without_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = sent_resume_record();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let mut before = serde_json::to_value(&record).unwrap();
+        before["unknownPreservedField"] = json!("preserve");
+        std::fs::write(&path, serde_json::to_vec(&before).unwrap()).unwrap();
+        assert!(
+            complete_late_recovery(&path, &before, &[late_confirmation(&record)], &|| Ok(()))
+                .unwrap()
+        );
+        let after = read_recovery_value(&path).unwrap();
+        assert_eq!(after["phase"], "completed");
+        assert_eq!(after["resumeIntents"], before["resumeIntents"]);
+        assert_eq!(after["pausedTasks"], before["pausedTasks"]);
+        assert_eq!(after["plannedTasks"], before["plannedTasks"]);
+        assert_eq!(after["unknownPreservedField"], "preserve");
+        assert_eq!(after["resumeConfirmations"][0]["alreadyObserved"], true);
+        assert_eq!(after["resumedTasks"], before["resumeIntents"]);
+        assert!(after["settlementReason"]
+            .as_str()
+            .unwrap()
+            .contains("未重复发送继续"));
+    }
+
+    #[test]
+    fn late_resume_settlement_rejects_missing_duplicate_or_wrong_operation_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = sent_resume_record();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        for changed in 0..7 {
+            let mut confirmation = late_confirmation(&record);
+            match changed {
+                0 => confirmation.thread_id = "unrelated".into(),
+                1 => confirmation.operation_id = "unrelated".into(),
+                2 => confirmation.turn_id.clear(),
+                3 => confirmation.turn_id = record.paused_tasks[0].turn_id.clone(),
+                4 => confirmation.already_observed = false,
+                _ => (),
+            }
+            let confirmations = match changed {
+                5 => vec![],
+                6 => vec![confirmation.clone(), confirmation],
+                _ => vec![confirmation],
+            };
+            assert!(
+                !complete_late_recovery(&path, &before, &confirmations, &|| Ok(())).unwrap(),
+                "case {changed}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        assert!(
+            complete_late_recovery(&path, &before, &[late_confirmation(&record)], &|| Err(
+                "cancelled".into()
+            ))
+            .is_err()
+        );
+        let mut changed = before.clone();
+        changed["phase"] = json!("cancelled");
+        std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(
+            !complete_late_recovery(&path, &before, &[late_confirmation(&record)], &|| Ok(()))
+                .unwrap()
+        );
+        assert_eq!(read_recovery_value(&path).unwrap(), changed);
+    }
+
+    #[test]
+    fn partial_sent_recovery_is_superseded_only_after_every_owned_pause_changed() {
+        let mut record = sent_resume_record();
+        let mut second = record.paused_tasks[0].clone();
+        second.thread_id = "019ed000-2222-7222-8222-222222222222".into();
+        record.paused_tasks.push(second.clone());
+        let mut planned = record.planned_tasks[0].clone();
+        planned.thread_id = second.thread_id.clone();
+        record.planned_tasks.push(planned);
+        assert!(changed_recovery_candidate(&record, "target"));
+        assert!(!late_resume_candidate(&record, "target"));
+        let mut first_live = original_task();
+        first_live.turn_id = Some("resumed-first".into());
+        first_live.status = Some("inProgress".into());
+        first_live.runtime_status = "active".into();
+        let mut second_live = original_task();
+        second_live.thread_id = second.thread_id.clone();
+        let mut inventory = TaskInventory {
+            running: vec![first_live],
+            idle: vec![second_live.clone()],
+            candidate_coverage_complete: true,
+            ..Default::default()
+        };
+        assert!(!all_saved_tasks_were_changed(&record, &inventory));
+        second_live.turn_id = Some("user-continued-second".into());
+        second_live.status = Some("inProgress".into());
+        second_live.runtime_status = "active".into();
+        inventory.idle.clear();
+        inventory.running.push(second_live);
+        assert!(all_saved_tasks_were_changed(&record, &inventory));
+        let directory = tempfile::tempdir().unwrap();
+        record.persist_in(directory.path()).unwrap();
+        let path = directory.path().join(format!("{WAIT_ID}.json"));
+        let before = read_recovery_value(&path).unwrap();
+        assert!(
+            supersede_obsolete_recovery(&path, &before, &record.paused_tasks, &|| Ok(())).unwrap()
+        );
+        let after = read_recovery_value(&path).unwrap();
+        assert_eq!(after["phase"], "superseded");
+        assert_eq!(after["resumeIntents"], before["resumeIntents"]);
+        assert_eq!(after["resumedTasks"], before["resumedTasks"]);
+    }
+
+    #[test]
+    fn reset_wait_late_confirmation_retains_explicitly_abandoned_task_history() {
+        let mut record = sent_resume_record();
+        let mut abandoned = record.planned_tasks[0].clone();
+        abandoned.thread_id = "019ed000-2222-7222-8222-222222222222".into();
+        record.abandoned_tasks.push(abandoned.thread_id.clone());
+        record.planned_tasks.push(abandoned);
+        assert!(late_resume_candidate(&record, "target"));
+        record.abandoned_tasks[0] = record.paused_tasks[0].thread_id.clone();
+        assert!(!changed_recovery_candidate(&record, "target"));
     }
 
     #[test]
@@ -2018,6 +2481,37 @@ mod tests {
             ..Default::default()
         };
         assert!(!all_saved_tasks_were_changed(&record, &duplicate));
+    }
+
+    #[test]
+    fn own_unconfirmed_new_turn_never_supersedes_model_or_permission_failure() {
+        let record = sent_resume_record();
+        let mut task = original_task();
+        task.turn_id = Some("this-operation-new-turn".into());
+        task.status = Some("inProgress".into());
+        task.runtime_status = "active".into();
+        task.client_user_message_id = Some(record.operation_id.clone());
+        for field in 0..3 {
+            let mut changed = task.clone();
+            match field {
+                0 => changed.context.model = Some("wrong-model".into()),
+                1 => changed.context.current_permissions = json!("wrong-permissions"),
+                _ => (),
+            }
+            let inventory = TaskInventory {
+                running: vec![changed],
+                candidate_coverage_complete: true,
+                ..Default::default()
+            };
+            assert!(!all_saved_tasks_were_changed(&record, &inventory));
+        }
+        task.client_user_message_id = Some("later-user-operation".into());
+        let inventory = TaskInventory {
+            running: vec![task],
+            candidate_coverage_complete: true,
+            ..Default::default()
+        };
+        assert!(all_saved_tasks_were_changed(&record, &inventory));
     }
 
     #[test]
@@ -2246,6 +2740,32 @@ mod tests {
     }
 
     #[test]
+    fn quota_wait_uses_confirmed_reopened_time_not_original_duration_estimate() {
+        let mut original = original_task();
+        original.status = Some("failed".into());
+        original.runtime_status = "systemError".into();
+        original.turn_error_code = Some("usageLimitExceeded".into());
+        original.turn_ended_at_ms = Some(1_791_799_168_552);
+        let saved: PausedTask = serde_json::from_value(json!({
+            "threadId":original.thread_id,"turnId":original.turn_id,"context":original.context,
+            "pauseOperationId":WAIT_ID,"confirmedByCcSwitch":false,"origin":"quotaExhausted",
+            "turnEndedAtMs":original.turn_ended_at_ms
+        }))
+        .unwrap();
+        let mut reopened = original.clone();
+        reopened.runtime_status = "idle".into();
+        reopened.turn_ended_at_ms = Some(1_791_799_168_047);
+        assert!(!reopened.matches_paused(&saved));
+        assert!(matches_wait_baseline(&reopened, &reopened, &saved));
+        let mut changed = reopened.clone();
+        changed.turn_ended_at_ms = original.turn_ended_at_ms;
+        assert!(!matches_wait_baseline(&changed, &reopened, &saved));
+        let mut unrelated = reopened.clone();
+        unrelated.turn_id = Some("another-turn".into());
+        assert!(!matches_wait_baseline(&reopened, &unrelated, &saved));
+    }
+
+    #[test]
     fn final_shutdown_check_rejects_new_work_approval_and_unknown_coverage() {
         let original = original_task();
         let saved = paused(&original);
@@ -2336,7 +2856,10 @@ async fn connect_reopened_desktop(
     loop {
         guard()?;
         match DesktopSession::connect().await {
-            Ok(session) => return Ok(session),
+            Ok(mut session) => {
+                session.set_trusted_codex_home(crate::codex_config::get_codex_config_dir());
+                return Ok(session);
+            }
             Err(error) if tokio::time::Instant::now() >= deadline => {
                 return Err(format!("重开后桌面协作连接未就绪：{error}"))
             }

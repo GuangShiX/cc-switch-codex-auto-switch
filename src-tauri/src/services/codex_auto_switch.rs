@@ -679,6 +679,17 @@ fn usable_account_outcome(inner: &Runtime, current_provider: &str) -> (&'static 
     ("monitoring", "当前账号额度仍可使用".into())
 }
 
+fn clear_reconciled_followup_failure(inner: &mut Runtime, generation: u64, provider: &str) {
+    if inner.generation == generation
+        && inner
+            .last_desktop_followup_failure
+            .as_ref()
+            .is_some_and(|(failed, _)| failed == provider)
+    {
+        inner.last_desktop_followup_failure = None;
+    }
+}
+
 pub fn plan_is_current(
     app: &tauri::AppHandle,
     generation: u64,
@@ -1096,20 +1107,26 @@ async fn run_automatic(app: tauri::AppHandle, generation: u64) {
     }
     // A previous desktop recovery must not freeze quota monitoring. Refresh
     // the current account first, then reconcile only provably obsolete tickets.
-    if let Err(error) = crate::services::codex_desktop_bridge::reconcile_obsolete_recovery(
+    let reconciled = match crate::services::codex_desktop_bridge::reconcile_obsolete_recovery(
         &app, generation, &current,
     )
     .await
     {
-        finish(&app, generation, "blocked", error);
-        return;
-    }
+        Ok(count) => count,
+        Err(error) => {
+            finish(&app, generation, "blocked", error);
+            return;
+        }
+    };
     if plan_is_current(&app, generation, &current).is_err() {
         return;
     }
     if let Some(reason) = crate::services::codex_desktop_bridge::pending_recovery_reason() {
         finish(&app, generation, "blocked", reason);
         return;
+    }
+    if reconciled > 0 {
+        clear_reconciled_followup_failure(&mut lock_runtime(), generation, &current);
     }
     if let Some(wait) = waiting {
         if wait.provider_id != current || wait.account_id != current_account_id {
@@ -1972,6 +1989,20 @@ mod tests {
         record_desktop_followup_result(&mut inner, 8, "selected", &Ok(true));
         assert_eq!(usable_account_outcome(&inner, "selected").0, "blocked");
         record_desktop_followup_result(&mut inner, 9, "selected", &Ok(true));
+        assert!(inner.last_desktop_followup_failure.is_none());
+        assert_eq!(usable_account_outcome(&inner, "selected").0, "monitoring");
+    }
+
+    #[test]
+    fn readonly_settlement_clears_only_current_generation_and_provider_warning() {
+        let mut inner = Runtime::default();
+        inner.generation = 9;
+        record_desktop_followup_result(&mut inner, 9, "selected", &Err("late confirmation".into()));
+        clear_reconciled_followup_failure(&mut inner, 8, "selected");
+        assert!(inner.last_desktop_followup_failure.is_some());
+        clear_reconciled_followup_failure(&mut inner, 9, "other");
+        assert!(inner.last_desktop_followup_failure.is_some());
+        clear_reconciled_followup_failure(&mut inner, 9, "selected");
         assert!(inner.last_desktop_followup_failure.is_none());
         assert_eq!(usable_account_outcome(&inner, "selected").0, "monitoring");
     }

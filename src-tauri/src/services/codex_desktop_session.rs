@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -145,9 +146,17 @@ impl TaskSnapshot {
     }
 
     pub fn safely_idle(&self) -> bool {
-        matches!(self.runtime_status.as_str(), "idle" | "notLoaded")
-            && self.status.as_deref() != Some("inProgress")
-            && !self.waiting
+        !self.waiting
+            && ((matches!(self.runtime_status.as_str(), "idle" | "notLoaded")
+                && self.status.as_deref() != Some("inProgress"))
+                // A known failed turn has already stopped. A non-quota error
+                // must not block restarting other chats, and is never a
+                // reason to capture this chat for automatic continuation.
+                || (self.runtime_status == "systemError"
+                    && self.status.as_deref() == Some("failed")
+                    && self.turn_id.is_some()
+                    && !self.is_child
+                    && !self.ephemeral))
     }
 
     pub fn safely_quota_failed(&self) -> bool {
@@ -190,6 +199,21 @@ impl TaskSnapshot {
                     && paused.turn_ended_at_ms.is_some()
                     && self.turn_ended_at_ms == paused.turn_ended_at_ms
             }
+        }
+    }
+
+    fn matches_reopened_recovery_origin(&self, paused: &PausedTask) -> bool {
+        if paused.origin == RecoveryOrigin::QuotaExhausted && paused.saved_settings.is_some() {
+            // The desktop reconstructs durationMs when it loads a persisted
+            // failed turn, so start + duration is not a stable identity across
+            // restarts. Its saved time proves freshness at capture only. The
+            // caller still binds the original thread/turn, exact quota error,
+            // saved project/model, and a fresh baseline before sending once.
+            !paused.confirmed_by_cc_switch
+                && paused.turn_ended_at_ms.is_some()
+                && self.safely_quota_failed()
+        } else {
+            self.matches_recovery_origin(paused)
         }
     }
 
@@ -289,11 +313,19 @@ pub struct DesktopSession {
     resync_needed: HashSet<String>,
     mutation_attempts: HashSet<String>,
     reopened_baselines: HashMap<String, TaskSnapshot>,
+    trusted_codex_home: Option<PathBuf>,
     compatible: bool,
     broken: bool,
 }
 
 impl DesktopSession {
+    /// Supplied by the verified local desktop integration, never by thread metadata.
+    /// This is used only to recognize the desktop's own visualization root after
+    /// a resume; all checks before sending a resume remain exact.
+    pub fn set_trusted_codex_home(&mut self, home: PathBuf) {
+        self.trusted_codex_home = home.is_absolute().then_some(home);
+    }
+
     pub async fn connect() -> Result<Self, SessionError> {
         #[cfg(target_os = "windows")]
         {
@@ -326,6 +358,7 @@ impl DesktopSession {
             resync_needed: HashSet::new(),
             mutation_attempts: HashSet::new(),
             reopened_baselines: HashMap::new(),
+            trusted_codex_home: None,
             compatible: true,
             broken: false,
         };
@@ -780,7 +813,7 @@ impl DesktopSession {
         if !unchanged_pause {
             return Err(SessionError::new(
                 SessionErrorKind::StateChanged,
-                "恢复前原轮次、模型、权限或等待状态已改变；不会自动继续用户停止或已完成任务",
+                format!("恢复前原轮次、模型、权限或等待状态已改变（{}）；不会自动继续用户停止或已完成任务", fresh_resume_mismatch_diagnostics(&current, paused, self.reopened_baselines.get(&pause_key(paused)))),
             ));
         }
         self.confirm_owner(&current).await?;
@@ -843,9 +876,10 @@ impl DesktopSession {
                     || (current.waiting && !belongs_to_this_start)
                     || !same_saved_project_and_model(&current, paused)
                 {
-                    return Err(SessionError::uncertain(
-                        "恢复结果与本次操作无法对应，需核对原聊天；未重复发送继续",
-                    ));
+                    return Err(SessionError::uncertain(format!(
+                        "恢复结果与本次操作无法对应，需核对原聊天（{}）；未重复发送继续",
+                        self.resume_observation_diagnostics(paused, operation_id)
+                    )));
                 }
             }
             if self.broken || tokio::time::Instant::now() >= deadline {
@@ -863,9 +897,43 @@ impl DesktopSession {
                 .await
                 .map_err(|error| SessionError::uncertain(error.message))?;
         }
-        Err(SessionError::uncertain(
-            "未确认本次恢复产生的新轮次；不会盲目重发继续",
-        ))
+        Err(SessionError::uncertain(format!(
+            "未确认本次恢复产生的新轮次（{}）；不会盲目重发继续",
+            self.resume_observation_diagnostics(paused, operation_id)
+        )))
+    }
+
+    fn resume_observation_diagnostics(&self, paused: &PausedTask, operation_id: &str) -> String {
+        let Some(current) = self.current_snapshot(&paused.thread_id) else {
+            return "实时快照=未收到".into();
+        };
+        let metadata = &self.states[&paused.thread_id].metadata;
+        let settings = paused.saved_settings.as_ref();
+        let visualization_root = self
+            .trusted_codex_home
+            .as_deref()
+            .and_then(|home| trusted_visualization_root(home, &paused.thread_id));
+        let permissions_match = settings.map(|saved| {
+            effective_permissions_match_for_resume(
+                &metadata["currentPermissions"],
+                saved,
+                visualization_root.as_deref(),
+                paused.context.cwd.as_deref(),
+            )
+        });
+        let model_settings_match =
+            settings.map(|saved| resumed_model_settings_match(metadata, saved));
+        format!(
+            "新轮次={}，本次操作={}，状态={}，运行态={}，等待={}，项目模型={}，权限={}，模型设置={}",
+            current.turn_id.as_deref().is_some_and(|id| id != paused.turn_id),
+            current.client_user_message_id.as_deref() == Some(operation_id),
+            diagnostic_turn_status(current.status.as_deref()),
+            diagnostic_runtime_status(&current.runtime_status),
+            current.waiting,
+            same_saved_project_and_model(&current, paused),
+            diagnostic_match(permissions_match),
+            diagnostic_match(model_settings_match),
+        )
     }
 
     fn resumed_confirmation(
@@ -880,6 +948,10 @@ impl DesktopSession {
         }
         let saved = paused.saved_settings.as_ref()?;
         let metadata = &self.states.get(&paused.thread_id)?.metadata;
+        let visualization_root = self
+            .trusted_codex_home
+            .as_deref()
+            .and_then(|home| trusted_visualization_root(home, &paused.thread_id));
         (current.thread_id == paused.thread_id
             && current
                 .turn_id
@@ -889,7 +961,12 @@ impl DesktopSession {
             && same_saved_project_and_model(current, paused)
             && !current.is_child
             && !current.ephemeral
-            && effective_permissions_match(&metadata["currentPermissions"], saved)
+            && effective_permissions_match_for_resume(
+                &metadata["currentPermissions"],
+                saved,
+                visualization_root.as_deref(),
+                paused.context.cwd.as_deref(),
+            )
             && resumed_model_settings_match(metadata, saved))
         .then(|| ResumeConfirmation {
             thread_id: paused.thread_id.clone(),
@@ -1412,7 +1489,7 @@ fn matches_reopened_pause(current: &TaskSnapshot, paused: &PausedTask) -> bool {
     }
     current.thread_id == paused.thread_id
         && current.turn_id.as_deref() == Some(paused.turn_id.as_str())
-        && current.matches_recovery_origin(paused)
+        && current.matches_reopened_recovery_origin(paused)
         && !current.is_child
         && !current.ephemeral
         && same_saved_project_and_model(current, paused)
@@ -1456,7 +1533,12 @@ fn recovery_mismatch_fields(current: &TaskSnapshot, paused: &PausedTask, reopene
     if current.turn_id.as_deref() != Some(paused.turn_id.as_str()) {
         fields.push("轮次");
     }
-    if !current.matches_recovery_origin(paused) {
+    let origin_matches = if reopened {
+        current.matches_reopened_recovery_origin(paused)
+    } else {
+        current.matches_recovery_origin(paused)
+    };
+    if !origin_matches {
         fields.push("停止原因或运行状态");
     }
     if current.waiting {
@@ -1485,7 +1567,76 @@ fn recovery_mismatch_fields(current: &TaskSnapshot, paused: &PausedTask, reopene
     if fields.is_empty() {
         fields.push("恢复基线");
     }
-    fields.join("、")
+    let stop_state = format!(
+        "状态={}，运行态={}，额度错误={}，结束时间一致={}",
+        diagnostic_turn_status(current.status.as_deref()),
+        diagnostic_runtime_status(&current.runtime_status),
+        current.turn_error_code.as_deref() == Some("usageLimitExceeded"),
+        current.turn_ended_at_ms == paused.turn_ended_at_ms,
+    );
+    format!("{}；{}", fields.join("、"), stop_state)
+}
+
+fn fresh_resume_mismatch_diagnostics(
+    current: &TaskSnapshot,
+    paused: &PausedTask,
+    baseline: Option<&TaskSnapshot>,
+) -> String {
+    let Some(baseline) = baseline else {
+        return format!(
+            "已重开基线=false，{}",
+            recovery_mismatch_fields(current, paused, false)
+        );
+    };
+    // Boolean comparisons only: no owner/thread/turn identifiers, directory
+    // names, setting values or permission contents are written to diagnostics.
+    format!("已重开基线=true，聊天变化={}，轮次变化={}，状态变化={}，运行态变化={}，错误变化={}，结束时间变化={}，owner变化={}，等待变化={}，聊天类型变化={}，请求变化={}，项目变化={}，模型变化={}，供应商变化={}，任务设置变化={}，权限变化={}，原暂停匹配={}",
+        current.thread_id != baseline.thread_id,
+        current.turn_id != baseline.turn_id,
+        current.status != baseline.status,
+        current.runtime_status != baseline.runtime_status,
+        current.turn_error_code != baseline.turn_error_code,
+        current.turn_ended_at_ms != baseline.turn_ended_at_ms,
+        current.owner != baseline.owner,
+        current.waiting != baseline.waiting || current.waiting_reason != baseline.waiting_reason,
+        current.is_child != baseline.is_child || current.ephemeral != baseline.ephemeral,
+        current.client_user_message_id != baseline.client_user_message_id,
+        current.context.cwd != baseline.context.cwd,
+        current.context.model != baseline.context.model,
+        current.context.model_provider != baseline.context.model_provider,
+        current.context.thread_settings != baseline.context.thread_settings,
+        current.context.current_permissions != baseline.context.current_permissions,
+        matches_reopened_pause(current, paused))
+}
+
+// Diagnostics accept enum labels and booleans only, never arbitrary desktop
+// values, thread ids, permission contents, model names or project paths.
+fn diagnostic_turn_status(status: Option<&str>) -> &'static str {
+    match status {
+        Some("inProgress") => "inProgress",
+        Some("failed") => "failed",
+        Some("interrupted") => "interrupted",
+        Some("completed") => "completed",
+        _ => "unknown",
+    }
+}
+
+fn diagnostic_runtime_status(status: &str) -> &'static str {
+    match status {
+        "active" => "active",
+        "idle" => "idle",
+        "notLoaded" => "notLoaded",
+        "systemError" => "systemError",
+        _ => "unknown",
+    }
+}
+
+fn diagnostic_match(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "一致",
+        Some(false) => "不一致",
+        None => "无保存设置",
+    }
 }
 
 fn save_settings_error() -> SessionError {
@@ -1761,14 +1912,41 @@ fn resumed_model_settings_match(metadata: &Value, saved: &SavedTaskSettings) -> 
     effort_ok && mode_ok
 }
 
-fn effective_permissions_match(current: &Value, saved: &SavedTaskSettings) -> bool {
-    ["approvalPolicy", "approvalsReviewer", "sandboxPolicy"]
-        .iter()
-        .all(|key| {
-            saved.thread_settings.get(*key).is_none_or(|expected| {
-                current.get(*key) == Some(expected)
-                    || (expected.is_null() && current.get(*key).is_none())
-            })
+#[cfg(test)]
+fn effective_permissions_match(
+    current: &Value,
+    saved: &SavedTaskSettings,
+    visualization_root: Option<&str>,
+) -> bool {
+    effective_permissions_match_for_resume(current, saved, visualization_root, None)
+}
+
+fn effective_permissions_match_for_resume(
+    current: &Value,
+    saved: &SavedTaskSettings,
+    visualization_root: Option<&str>,
+    original_cwd: Option<&str>,
+) -> bool {
+    // The desktop may materialize its already-authorized project root in the
+    // sandbox policy. Bind this to the saved task's actual cwd and preexisting
+    // runtime roots; a newly requested project/root cannot gain this exception.
+    let implicit_cwd = saved.thread_settings["cwd"].as_str().filter(|cwd| {
+        Some(*cwd) == original_cwd
+            && workspace_roots(&saved.current_permissions["runtimeWorkspaceRoots"])
+                .is_some_and(|roots| roots.contains(&normalized_workspace_root(cwd)))
+    });
+    ["approvalPolicy", "approvalsReviewer"].iter().all(|key| {
+        saved.thread_settings.get(*key).is_none_or(|expected| {
+            current.get(*key) == Some(expected)
+                || (expected.is_null() && current.get(*key).is_none())
+        })
+    }) && saved
+        .thread_settings
+        .get("sandboxPolicy")
+        .is_none_or(|expected| {
+            current.get("sandboxPolicy").is_some_and(|actual| {
+                resumed_sandbox_policy_match(actual, expected, visualization_root, implicit_cwd)
+            }) || (expected.is_null() && current.get("sandboxPolicy").is_none())
         })
         && current["activePermissionProfile"]["id"]
             == saved.thread_settings["activePermissionProfile"]["id"]
@@ -1777,30 +1955,118 @@ fn effective_permissions_match(current: &Value, saved: &SavedTaskSettings) -> bo
                 .current_permissions
                 .get("runtimeWorkspaceRoots")
                 .is_none_or(|expected| {
-                    workspace_roots_match(&current["runtimeWorkspaceRoots"], expected)
+                    resumed_workspace_roots_match(
+                        &current["runtimeWorkspaceRoots"],
+                        expected,
+                        visualization_root,
+                    )
                 }))
 }
 
-fn workspace_roots_match(actual: &Value, expected: &Value) -> bool {
-    let roots = |value: &Value| {
-        value.as_array().and_then(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    item.as_str().map(|path| {
-                        let normalized = path.replace('\\', "/");
-                        let normalized = normalized.trim_end_matches('/');
-                        if cfg!(target_os = "windows") {
-                            normalized.to_lowercase()
-                        } else {
-                            normalized.to_string()
-                        }
-                    })
-                })
-                .collect::<Option<HashSet<_>>>()
-        })
+fn normalized_workspace_root(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    if cfg!(target_os = "windows") {
+        normalized.to_lowercase()
+    } else {
+        normalized.to_string()
+    }
+}
+
+fn workspace_roots(value: &Value) -> Option<HashSet<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(normalized_workspace_root))
+        .collect()
+}
+
+fn resumed_workspace_roots_match(
+    actual: &Value,
+    expected: &Value,
+    visualization_root: Option<&str>,
+) -> bool {
+    resumed_root_set_match(actual, expected, visualization_root, None)
+}
+
+fn resumed_root_set_match(
+    actual: &Value,
+    expected: &Value,
+    visualization_root: Option<&str>,
+    implicit_cwd: Option<&str>,
+) -> bool {
+    let (Some(actual), Some(expected)) = (workspace_roots(actual), workspace_roots(expected))
+    else {
+        return false;
     };
-    roots(actual).is_some_and(|actual| roots(expected).is_some_and(|expected| actual == expected))
+    if actual == expected {
+        return true;
+    }
+    // Native desktop turn preparation may add this thread's visualization root
+    // for the first time. This is not permission to accept arbitrary new roots,
+    // another thread's root, changed dates, removals or a broader parent folder.
+    let allowed: HashSet<_> = [visualization_root, implicit_cwd]
+        .into_iter()
+        .flatten()
+        .map(normalized_workspace_root)
+        .collect();
+    expected.is_subset(&actual)
+        && actual
+            .difference(&expected)
+            .all(|root| allowed.contains(root))
+}
+
+fn resumed_sandbox_policy_match(
+    actual: &Value,
+    expected: &Value,
+    visualization_root: Option<&str>,
+    implicit_cwd: Option<&str>,
+) -> bool {
+    if actual == expected {
+        return true;
+    }
+    if actual["type"] != "workspaceWrite" || expected["type"] != "workspaceWrite" {
+        return false;
+    }
+    let (Some(mut actual_policy), Some(mut expected_policy)) =
+        (actual.as_object().cloned(), expected.as_object().cloned())
+    else {
+        return false;
+    };
+    let (Some(actual_roots), Some(expected_roots)) = (
+        actual_policy.remove("writableRoots"),
+        expected_policy.remove("writableRoots"),
+    ) else {
+        return false;
+    };
+    actual_policy == expected_policy
+        && resumed_root_set_match(
+            &actual_roots,
+            &expected_roots,
+            visualization_root,
+            implicit_cwd,
+        )
+}
+
+fn trusted_visualization_root(home: &Path, thread_id: &str) -> Option<String> {
+    let id = uuid::Uuid::parse_str(thread_id).ok()?;
+    if !home.is_absolute()
+        || id.get_version_num() != 7
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.hyphenated().to_string() != thread_id.to_ascii_lowercase()
+    {
+        return None;
+    }
+    // Match the native desktop's UUIDv7 creation date in UTC, not today's date
+    // or the user's local timezone. No rollout/history lookup is required.
+    let timestamp = id.as_bytes()[..6]
+        .iter()
+        .fold(0_i64, |value, byte| (value << 8) | i64::from(*byte));
+    let date = chrono::DateTime::from_timestamp_millis(timestamp)?
+        .format("%Y/%m/%d")
+        .to_string();
+    let root = home.join("visualizations").join(date).join(thread_id);
+    root.to_str().map(normalized_workspace_root)
 }
 
 fn resumed_by_operation(
@@ -2824,7 +3090,63 @@ mod tests {
         let task = summarize(&project_at(&[], &quota_failed_state()).unwrap(), "owner").unwrap();
         ticket.turn_ended_at_ms = ticket.turn_ended_at_ms.map(|ended| ended + 1);
         assert!(!task.matches_paused(&ticket));
-        assert!(!matches_reopened_pause(&task, &ticket));
+        assert!(matches_reopened_pause(&task, &ticket));
+    }
+
+    #[tokio::test]
+    async fn reopened_quota_failure_accepts_rebuilt_duration_without_replaying_a_turn() {
+        let ticket = quota_ticket();
+        let mut hydrated = quota_failed_state();
+        // Reproduce the same persisted quota-failed turn observed before and
+        // after the 2026-10-12 desktop restart: its estimate drifted by 505 ms.
+        hydrated["turns"][0]["durationMs"] = json!(9_495);
+        hydrated["threadRuntimeStatus"]["type"] = json!("idle");
+        let task = summarize(&project_at(&[], &hydrated).unwrap(), "new-owner").unwrap();
+        assert_eq!(
+            ticket.turn_ended_at_ms.unwrap() - task.turn_ended_at_ms.unwrap(),
+            505
+        );
+        assert!(!task.matches_paused(&ticket));
+        assert!(matches_reopened_pause(&task, &ticket));
+        let (mut session, owner) = subscription_owner(hydrated, Duration::ZERO, None);
+        let observed = session
+            .wait_for_reopened_paused_chat(&ticket, || true)
+            .await
+            .unwrap();
+        assert_eq!(observed, task);
+        assert_eq!(session.reopened_baselines[&pause_key(&ticket)], task);
+        assert!(session.mutation_attempts.is_empty());
+        drop(session);
+        assert!(owner
+            .await
+            .unwrap()
+            .iter()
+            .all(|method| method == "thread-stream-following-changed"));
+    }
+
+    #[test]
+    fn reopened_quota_time_is_not_identity_but_uncaptured_and_user_changed_work_is_rejected() {
+        let ticket = quota_ticket();
+        for duration in [Value::Null, json!(9_495), json!(10_505)] {
+            let mut hydrated = quota_failed_state();
+            hydrated["turns"][0]["durationMs"] = duration;
+            let task = summarize(&project_at(&[], &hydrated).unwrap(), "new-owner").unwrap();
+            assert!(matches_reopened_pause(&task, &ticket));
+            let mut uncaptured = ticket.clone();
+            uncaptured.turn_ended_at_ms = None;
+            assert!(!matches_reopened_pause(&task, &uncaptured));
+            for status in ["interrupted", "completed", "inProgress"] {
+                let mut changed = task.clone();
+                changed.status = Some(status.into());
+                assert!(!matches_reopened_pause(&changed, &ticket));
+            }
+            let mut changed = task.clone();
+            changed.turn_id = Some("user-new-turn".into());
+            assert!(!matches_reopened_pause(&changed, &ticket));
+            let mut changed = task;
+            changed.waiting = true;
+            assert!(!matches_reopened_pause(&changed, &ticket));
+        }
     }
     fn paused() -> PausedTask {
         let task = summarize(&projected("interrupted"), "owner").unwrap();
@@ -2850,6 +3172,7 @@ mod tests {
             resync_needed: HashSet::new(),
             mutation_attempts: HashSet::new(),
             reopened_baselines: HashMap::new(),
+            trusted_codex_home: None,
             compatible: true,
             broken: false,
         }
@@ -2886,6 +3209,48 @@ mod tests {
         assert!(task.safely_idle());
         assert_eq!(task.status.as_deref(), Some("interrupted"));
         assert!(!serde_json::to_string(&metadata).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn failed_system_error_is_idle_but_never_quota_recovery_without_exact_error() {
+        let mut failed = quota_failed_state();
+        failed["turns"][0]["error"]["codexErrorInfo"] = json!("other");
+        let task = summarize(&project_at(&[], &failed).unwrap(), "owner").unwrap();
+        assert!(task.safely_idle());
+        assert!(
+            !task.safely_running() && !task.safely_quota_failed() && !task.recent_quota_failure()
+        );
+        assert!(!task.matches_paused(&quota_ticket()));
+        for runtime in ["active", "unknown"] {
+            let mut changed = failed.clone();
+            changed["threadRuntimeStatus"]["type"] = json!(runtime);
+            assert!(!summarize(&project_at(&[], &changed).unwrap(), "owner")
+                .unwrap()
+                .safely_idle());
+        }
+        for status in ["inProgress", "interrupted", "completed", "unknown"] {
+            let mut changed = failed.clone();
+            changed["turns"][0]["status"] = json!(status);
+            assert!(!summarize(&project_at(&[], &changed).unwrap(), "owner")
+                .unwrap()
+                .safely_idle());
+        }
+        for key in ["requests", "unconfirmedTurnSubmissions"] {
+            let mut changed = failed.clone();
+            changed[key] = json!([{"type":"unknown"}]);
+            assert!(!summarize(&project_at(&[], &changed).unwrap(), "owner")
+                .unwrap()
+                .safely_idle());
+        }
+        let mut changed = failed.clone();
+        changed["threadRuntimeStatus"]["activeFlags"] = json!(["waitingOnApproval"]);
+        assert!(!summarize(&project_at(&[], &changed).unwrap(), "owner")
+            .unwrap()
+            .safely_idle());
+        failed["turns"][0].as_object_mut().unwrap().remove("turnId");
+        assert!(!summarize(&project_at(&[], &failed).unwrap(), "owner")
+            .unwrap()
+            .safely_idle());
     }
 
     #[test]
@@ -3106,6 +3471,7 @@ mod tests {
             resync_needed: HashSet::new(),
             mutation_attempts: HashSet::new(),
             reopened_baselines: HashMap::new(),
+            trusted_codex_home: None,
             compatible: true,
             broken: false,
         };
@@ -3339,6 +3705,12 @@ mod tests {
         assert!(detail.contains("停止原因或运行状态"));
         assert!(detail.contains("项目") && detail.contains("模型"));
         assert!(!detail.contains("private") && !detail.contains(THREAD));
+        changed.status = Some("private-status-value".into());
+        changed.runtime_status = "private-runtime-value".into();
+        changed.turn_error_code = Some("private-server-error".into());
+        let detail = recovery_mismatch_fields(&changed, &paused(), true);
+        assert!(detail.contains("状态=unknown，运行态=unknown"));
+        assert!(!detail.contains("private") && !detail.contains(THREAD));
     }
 
     fn saved_paused() -> PausedTask {
@@ -3370,7 +3742,11 @@ mod tests {
         session.followed.clear();
         let behavior = behavior.to_owned();
         let task = tokio::spawn(async move {
-            let mut current = state("interrupted");
+            let mut current = if behavior == "changed-quota-baseline-time" {
+                quota_failed_state()
+            } else {
+                state("interrupted")
+            };
             if behavior == "null-plugins" || behavior == "changed-plugins-on-start" {
                 current["latestThreadSettings"]["disabledPluginIds"] = json!([]);
             }
@@ -3386,6 +3762,9 @@ mod tests {
                         if behavior == "changed-baseline" && follows == 2 {
                             current["latestReasoningEffort"] = json!("low");
                             current["latestThreadSettings"]["effort"] = json!("low");
+                        }
+                        if behavior == "changed-quota-baseline-time" && follows == 2 {
+                            current["turns"][0]["durationMs"] = json!(9_495);
                         }
                     }
                     "thread-owner-discovery" => {
@@ -3558,9 +3937,9 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("runtimeWorkspaceRoots");
-        assert!(effective_permissions_match(&actual, &saved));
+        assert!(effective_permissions_match(&actual, &saved, None));
         actual["approvalPolicy"] = json!("on-request");
-        assert!(!effective_permissions_match(&actual, &saved));
+        assert!(!effective_permissions_match(&actual, &saved, None));
 
         let mut saved = saved;
         saved.thread_settings["activePermissionProfile"] =
@@ -3568,12 +3947,236 @@ mod tests {
         actual = saved.current_permissions.clone();
         actual["activePermissionProfile"] = json!({"id":"original","extends":null});
         actual["runtimeWorkspaceRoots"] = json!(["C:\\project\\"]);
-        assert!(effective_permissions_match(&actual, &saved));
+        assert!(effective_permissions_match(&actual, &saved, None));
         actual["activePermissionProfile"]["id"] = json!("other");
-        assert!(!effective_permissions_match(&actual, &saved));
+        assert!(!effective_permissions_match(&actual, &saved, None));
         actual["activePermissionProfile"]["id"] = json!("original");
         actual["runtimeWorkspaceRoots"] = json!(["C:/other"]);
-        assert!(!effective_permissions_match(&actual, &saved));
+        assert!(!effective_permissions_match(&actual, &saved, None));
+    }
+
+    #[test]
+    fn resumed_permissions_accept_duplicate_or_reordered_existing_roots_only() {
+        let saved = capture_saved_settings(&state("interrupted")).unwrap();
+        let mut actual = saved.current_permissions.clone();
+        actual["sandboxPolicy"]["writableRoots"] = json!(["C:/project/", "C:/project"]);
+        assert!(effective_permissions_match(&actual, &saved, None));
+        if cfg!(target_os = "windows") {
+            actual["sandboxPolicy"]["writableRoots"] = json!(["c:\\PROJECT\\", "C:/project"]);
+            assert!(effective_permissions_match(&actual, &saved, None));
+        }
+        actual["sandboxPolicy"]["writableRoots"] = json!(["C:/project", "C:/other"]);
+        assert!(!effective_permissions_match(&actual, &saved, None));
+        actual["sandboxPolicy"]["writableRoots"] = json!([]);
+        assert!(!effective_permissions_match(&actual, &saved, None));
+    }
+
+    #[test]
+    fn visualization_root_uses_uuidv7_creation_date_in_utc_and_a_trusted_home() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019b8127-5c18-7000-8000-000000000001"; // 2026-01-02 23:59:59 UTC
+        let root = trusted_visualization_root(home.path(), thread).unwrap();
+        assert_eq!(
+            root,
+            normalized_workspace_root(
+                home.path()
+                    .join("visualizations/2026/01/02")
+                    .join(thread)
+                    .to_str()
+                    .unwrap()
+            )
+        );
+        assert!(trusted_visualization_root(home.path(), THREAD).is_none());
+        assert!(trusted_visualization_root(home.path(), &format!("urn:uuid:{thread}")).is_none());
+        assert!(
+            trusted_visualization_root(home.path(), "019b8127-5c18-7000-0000-000000000001")
+                .is_none()
+        );
+        assert!(trusted_visualization_root(Path::new("relative-home"), thread).is_none());
+    }
+
+    #[test]
+    fn resumed_permissions_accept_only_first_addition_of_exact_own_visualization_root() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019b8127-5c18-7000-8000-000000000001";
+        let own = trusted_visualization_root(home.path(), thread).unwrap();
+        let mut saved = capture_saved_settings(&state("interrupted")).unwrap();
+        saved.thread_settings["activePermissionProfile"] = json!({"id":"original"});
+        saved.current_permissions["activePermissionProfile"] = json!({"id":"original"});
+        let mut actual = saved.current_permissions.clone();
+        actual["sandboxPolicy"]["writableRoots"] = json!([own, "C:/project"]);
+        actual["runtimeWorkspaceRoots"] = json!([own, "C:/project"]);
+        assert!(!effective_permissions_match(&actual, &saved, None));
+        assert!(effective_permissions_match(&actual, &saved, Some(&own)));
+        for wrong in [
+            own.replace(thread, "019b8127-5c18-7000-8000-000000000002"),
+            own.replace("2026/01/02", "2026/01/03"),
+            normalized_workspace_root(home.path().join("visualizations").to_str().unwrap()),
+            format!("{own}/../other"),
+        ] {
+            let mut changed = actual.clone();
+            changed["sandboxPolicy"]["writableRoots"] = json!(["C:/project", wrong]);
+            assert!(!effective_permissions_match(&changed, &saved, Some(&own)));
+            changed = actual.clone();
+            changed["runtimeWorkspaceRoots"] = json!(["C:/project", wrong]);
+            assert!(!effective_permissions_match(&changed, &saved, Some(&own)));
+        }
+        for roots in [json!([own]), json!(["C:/project", own, "C:/other"])] {
+            let mut changed = actual.clone();
+            changed["sandboxPolicy"]["writableRoots"] = roots;
+            assert!(!effective_permissions_match(&changed, &saved, Some(&own)));
+        }
+        for (key, value) in [
+            ("networkAccess", json!(true)),
+            ("type", json!("dangerFullAccess")),
+            ("unknown", json!(true)),
+        ] {
+            let mut changed = actual.clone();
+            changed["sandboxPolicy"][key] = value;
+            assert!(!effective_permissions_match(&changed, &saved, Some(&own)));
+        }
+        for (key, value) in [
+            ("approvalPolicy", json!("never")),
+            ("approvalsReviewer", json!("other")),
+            ("activePermissionProfile", json!({"id":"other"})),
+        ] {
+            let mut changed = actual.clone();
+            changed[key] = value;
+            assert!(!effective_permissions_match(&changed, &saved, Some(&own)));
+        }
+        // Once the own root was already present, only the same root set is valid.
+        saved.thread_settings["sandboxPolicy"]["writableRoots"] = json!(["C:/project", own]);
+        saved.current_permissions = actual.clone();
+        assert!(effective_permissions_match(&actual, &saved, Some(&own)));
+        actual["sandboxPolicy"]["writableRoots"] = json!(["C:/project", own, "C:/other"]);
+        assert!(!effective_permissions_match(&actual, &saved, Some(&own)));
+    }
+
+    #[test]
+    fn own_visualization_root_is_confirmation_only_and_needs_same_resume_operation() {
+        let home = tempfile::tempdir().unwrap();
+        let thread = "019b8127-5c18-7000-8000-000000000001";
+        let own = trusted_visualization_root(home.path(), thread).unwrap();
+        let mut initial = state("interrupted");
+        initial["id"] = json!(thread);
+        let mut paused = saved_paused();
+        paused.thread_id = thread.into();
+        paused.context = summarize(&initial, "owner").unwrap().context;
+        paused.saved_settings = Some(capture_saved_settings(&initial).unwrap());
+        let mut current = initial.clone();
+        current["currentPermissions"]["sandboxPolicy"]["writableRoots"] =
+            json!(["C:/project", own]);
+        // The same change before a resume must still invalidate the saved baseline.
+        assert!(!summarize(&current, "owner")
+            .unwrap()
+            .matches_paused(&paused));
+        current["turns"][0]["turnId"] = json!("new-turn");
+        current["turns"][0]["status"] = json!("inProgress");
+        current["turns"][0]["params"]["clientUserMessageId"] = json!(OP);
+        current["threadRuntimeStatus"]["type"] = json!("active");
+        let snapshot = summarize(&current, "owner").unwrap();
+        let mut session = fake_session();
+        session.states.insert(
+            thread.into(),
+            TrackedState {
+                owner: "owner".into(),
+                revision: json!(1),
+                metadata: project_at(&[], &current).unwrap(),
+            },
+        );
+        assert!(session
+            .resumed_confirmation(&snapshot, &paused, OP, true)
+            .is_none());
+        session.set_trusted_codex_home(home.path().to_owned());
+        assert!(session
+            .resumed_confirmation(&snapshot, &paused, OP, true)
+            .is_some());
+        assert!(session
+            .resumed_confirmation(&snapshot, &paused, "other-operation", true)
+            .is_none());
+    }
+
+    #[test]
+    fn sandbox_may_materialize_only_saved_cwd_that_was_already_runtime_authorized() {
+        let mut saved = capture_saved_settings(&state("interrupted")).unwrap();
+        saved.thread_settings["activePermissionProfile"] = json!({"id":"original"});
+        saved.current_permissions["activePermissionProfile"] = json!({"id":"original"});
+        saved.thread_settings["sandboxPolicy"]["writableRoots"] = json!(["C:/data"]);
+        saved.current_permissions["sandboxPolicy"]["writableRoots"] = json!(["C:/data"]);
+        let mut actual = saved.current_permissions.clone();
+        actual["sandboxPolicy"]["writableRoots"] = json!(["C:/data", "C:/project"]);
+        assert!(effective_permissions_match_for_resume(
+            &actual,
+            &saved,
+            None,
+            Some("C:/project")
+        ));
+        assert!(!effective_permissions_match_for_resume(
+            &actual,
+            &saved,
+            None,
+            Some("C:/other")
+        ));
+        let mut unauthorized = saved.clone();
+        unauthorized.current_permissions["runtimeWorkspaceRoots"] = json!(["C:/data"]);
+        assert!(!effective_permissions_match_for_resume(
+            &actual,
+            &unauthorized,
+            None,
+            Some("C:/project")
+        ));
+        for roots in [
+            json!(["C:/project"]),
+            json!(["C:/data", "C:/project", "C:/other"]),
+        ] {
+            let mut changed = actual.clone();
+            changed["sandboxPolicy"]["writableRoots"] = roots;
+            assert!(!effective_permissions_match_for_resume(
+                &changed,
+                &saved,
+                None,
+                Some("C:/project")
+            ));
+        }
+        // Runtime roots cannot be expanded using the implicit-project exception.
+        let mut changed = actual.clone();
+        changed["runtimeWorkspaceRoots"] = json!(["C:/project", "C:/other"]);
+        assert!(!effective_permissions_match_for_resume(
+            &changed,
+            &saved,
+            None,
+            Some("C:/project")
+        ));
+        let home = tempfile::tempdir().unwrap();
+        let own = trusted_visualization_root(home.path(), "019b8127-5c18-7000-8000-000000000001")
+            .unwrap();
+        actual["sandboxPolicy"]["writableRoots"] = json!(["C:/data", "C:/project", own]);
+        actual["runtimeWorkspaceRoots"] = json!(["C:/project", own]);
+        assert!(effective_permissions_match_for_resume(
+            &actual,
+            &saved,
+            Some(&own),
+            Some("C:/project")
+        ));
+    }
+
+    #[test]
+    fn fresh_resume_diagnostics_report_changed_fields_without_private_values() {
+        let saved = saved_paused();
+        let baseline = summarize(&projected("interrupted"), "private-owner-old").unwrap();
+        let mut current = baseline.clone();
+        current.owner = "private-owner-new".into();
+        current.turn_ended_at_ms = Some(123);
+        current.context.current_permissions = json!("private-permission-digest");
+        current.context.cwd = Some("C:/private-project".into());
+        let detail = fresh_resume_mismatch_diagnostics(&current, &saved, Some(&baseline));
+        assert!(detail.contains("owner变化=true") && detail.contains("结束时间变化=true"));
+        assert!(detail.contains("权限变化=true") && detail.contains("项目变化=true"));
+        assert!(detail.contains("轮次变化=false") && detail.contains("状态变化=false"));
+        assert!(!detail.contains("private") && !detail.contains(THREAD) && !detail.contains(OP));
+        let detail = fresh_resume_mismatch_diagnostics(&current, &saved, None);
+        assert!(detail.contains("已重开基线=false"));
+        assert!(!detail.contains("private"));
     }
 
     #[tokio::test]
@@ -3612,6 +4215,55 @@ mod tests {
         );
         drop(session);
         assert_eq!(owner.await.unwrap(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_fresh_reopened_quota_baseline_strict_before_sending() {
+        let ticket = quota_ticket();
+        let (mut session, owner) = restoring_owner("changed-quota-baseline-time", None);
+        session
+            .wait_for_reopened_paused_chat(&ticket, || true)
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .resume_and_confirm(&ticket, OP, || true)
+                .await
+                .unwrap_err()
+                .kind,
+            SessionErrorKind::StateChanged
+        );
+        assert!(session.mutation_attempts.is_empty());
+        drop(session);
+        assert_eq!(owner.await.unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn resume_diagnostics_report_comparison_results_without_private_metadata() {
+        let mut session = fake_session();
+        let saved = saved_paused();
+        let mut current = state("inProgress");
+        current["turns"][0]["turnId"] = json!("private-new-turn-id");
+        current["turns"][0]["params"]["clientUserMessageId"] = json!(OP);
+        current["currentPermissions"]["approvalPolicy"] = json!("on-request");
+        session.states.insert(
+            THREAD.into(),
+            TrackedState {
+                owner: "private-owner".into(),
+                revision: json!(1),
+                metadata: project_at(&[], &current).unwrap(),
+            },
+        );
+        let detail = session.resume_observation_diagnostics(&saved, OP);
+        assert!(detail.contains("新轮次=true，本次操作=true"));
+        assert!(detail.contains("权限=不一致"));
+        assert!(!detail.contains("private") && !detail.contains(THREAD));
+        assert!(!detail.contains(OP) && !detail.contains("on-request"));
+        session.states.get_mut(THREAD).unwrap().metadata["threadRuntimeStatus"]["type"] =
+            json!("private-runtime");
+        let detail = session.resume_observation_diagnostics(&saved, OP);
+        assert!(detail.contains("运行态=unknown"));
+        assert!(!detail.contains("private"));
     }
 
     #[tokio::test]
@@ -3678,6 +4330,7 @@ mod tests {
             resync_needed: HashSet::new(),
             mutation_attempts: HashSet::new(),
             reopened_baselines: HashMap::new(),
+            trusted_codex_home: None,
             compatible: true,
             broken: false,
         };
