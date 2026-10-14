@@ -113,7 +113,7 @@ export function UsageDashboard({
   );
   const [showRebuildConfirm, setShowRebuildConfirm] = useState(false);
   const [rebuildingCodex, setRebuildingCodex] = useState(false);
-  const sessionSync = useUsageSessionSync(sessionAutoSyncEnabled);
+  const sessionSync = useUsageSessionSync(refreshIntervalMs);
 
   useEffect(() => {
     setRefreshIntervalMs(normalizeRefreshInterval(savedRefreshIntervalMs));

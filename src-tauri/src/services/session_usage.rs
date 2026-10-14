@@ -16,6 +16,8 @@ use crate::proxy::usage::parser::TokenUsage;
 use crate::services::usage_stats::{
     effective_usage_log_filter, find_model_pricing, should_skip_session_insert, DedupKey,
 };
+use futures::future::{BoxFuture, Shared};
+use futures::FutureExt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +25,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
 
 /// 同步结果
@@ -54,6 +57,105 @@ impl SessionSyncResult {
 pub fn session_sync_mutex() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+type SyncFlight = Shared<BoxFuture<'static, Result<SessionSyncResult, String>>>;
+
+/// Concurrent page, manual and background requests share one import. The worker
+/// owns its lifetime so closing the page cannot release the rebuild lock while
+/// the blocking file reader is still running.
+#[derive(Default)]
+struct SessionSyncFlights {
+    running: tokio::sync::Mutex<HashMap<usize, (u64, SyncFlight)>>,
+    sequence: AtomicU64,
+}
+
+impl SessionSyncFlights {
+    async fn run(
+        self: &Arc<Self>,
+        key: usize,
+        work: impl std::future::Future<Output = Result<SessionSyncResult, String>> + Send + 'static,
+    ) -> Result<SessionSyncResult, String> {
+        let flight = {
+            let mut running = self.running.lock().await;
+            if let Some((_, flight)) = running.get(&key) {
+                flight.clone()
+            } else {
+                let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+                let coordinator = self.clone();
+                let worker = tokio::spawn(async move {
+                    let result = std::panic::AssertUnwindSafe(work)
+                        .catch_unwind()
+                        .await
+                        .unwrap_or_else(|_| Err("会话用量同步任务异常退出".to_owned()));
+                    let mut running = coordinator.running.lock().await;
+                    if running
+                        .get(&key)
+                        .is_some_and(|(active, _)| *active == sequence)
+                    {
+                        running.remove(&key);
+                    }
+                    result
+                });
+                let flight = async move {
+                    worker
+                        .await
+                        .map_err(|error| format!("会话用量同步任务失败: {error}"))?
+                }
+                .boxed()
+                .shared();
+                running.insert(key, (sequence, flight.clone()));
+                flight
+            }
+        };
+        flight.await
+    }
+}
+
+fn session_sync_flights() -> &'static Arc<SessionSyncFlights> {
+    static FLIGHTS: OnceLock<Arc<SessionSyncFlights>> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Arc::new(SessionSyncFlights::default()))
+}
+
+pub async fn sync_all_coalesced(db: Arc<Database>) -> Result<SessionSyncResult, AppError> {
+    let key = Arc::as_ptr(&db) as usize;
+    session_sync_flights()
+        .run(key, async move {
+            let guard = session_sync_mutex().lock().await;
+            tauri::async_runtime::spawn_blocking(move || {
+                let _guard = guard;
+                sync_all_unlocked(&db)
+            })
+            .await
+            .map_err(|error| format!("会话用量同步任务失败: {error}"))
+        })
+        .await
+        .map_err(AppError::Message)
+}
+
+/// A periodic tick never queues behind an import or a rebuild. The next tick
+/// will recheck the setting; a foreground request may share this running work.
+pub async fn sync_all_background(db: Arc<Database>) -> Result<Option<SessionSyncResult>, AppError> {
+    let Ok(guard) = session_sync_mutex().try_lock() else {
+        return Ok(None);
+    };
+    let key = Arc::as_ptr(&db) as usize;
+    session_sync_flights()
+        .run(key, async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                let _guard = guard;
+                if crate::settings::get_settings().session_auto_sync_enabled {
+                    sync_all_unlocked(&db)
+                } else {
+                    SessionSyncResult::default()
+                }
+            })
+            .await
+            .map_err(|error| format!("会话用量同步任务失败: {error}"))
+        })
+        .await
+        .map(Some)
+        .map_err(AppError::Message)
 }
 
 /// session_log_sync 表一行的内存快照。
@@ -965,6 +1067,106 @@ mod tests {
         assert!(session_sync_mutex().try_lock().is_err());
         drop(first);
         assert!(session_sync_mutex().try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn background_sync_skips_busy_rebuild_without_queuing() {
+        let db = Arc::new(Database::memory().unwrap());
+        let guard = session_sync_mutex().lock().await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            sync_all_background(db),
+        )
+        .await
+        .expect("a periodic tick must not wait for the rebuild");
+        assert!(result.unwrap().is_none());
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn session_sync_flights_share_work_and_release_after_failure() {
+        let flights = Arc::new(SessionSyncFlights::default());
+        let calls = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let first_flights = flights.clone();
+        let first_calls = calls.clone();
+        let first = tokio::spawn(async move {
+            first_flights
+                .run(1, async move {
+                    first_calls.fetch_add(1, Ordering::Relaxed);
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    Err("synthetic import failure".to_owned())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        let second_flights = flights.clone();
+        let second_calls = calls.clone();
+        let second = tokio::spawn(async move {
+            second_flights
+                .run(1, async move {
+                    second_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(SessionSyncResult::default())
+                })
+                .await
+        });
+        // Wait until the second caller has polled and cloned the shared flight.
+        tokio::task::yield_now().await;
+        finish_tx.send(()).unwrap();
+        assert_eq!(
+            first.await.unwrap().unwrap_err(),
+            "synthetic import failure"
+        );
+        assert_eq!(
+            second.await.unwrap().unwrap_err(),
+            "synthetic import failure"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let result = flights
+            .run(1, async {
+                Ok(SessionSyncResult {
+                    imported: 3,
+                    ..SessionSyncResult::default()
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.imported, 3);
+    }
+
+    #[tokio::test]
+    async fn session_sync_worker_survives_page_cancellation() {
+        let flights = Arc::new(SessionSyncFlights::default());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let caller_flights = flights.clone();
+        let caller = tokio::spawn(async move {
+            caller_flights
+                .run(1, async move {
+                    started_tx.send(()).unwrap();
+                    finish_rx.await.unwrap();
+                    Ok(SessionSyncResult {
+                        imported: 7,
+                        ..SessionSyncResult::default()
+                    })
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let next_flights = flights.clone();
+        let next = tokio::spawn(async move {
+            next_flights
+                .run(1, async { panic!("must share the running importer") })
+                .await
+        });
+        tokio::task::yield_now().await;
+        finish_tx.send(()).unwrap();
+        assert_eq!(next.await.unwrap().unwrap().imported, 7);
+        assert!(flights.running.lock().await.is_empty());
     }
 
     #[test]

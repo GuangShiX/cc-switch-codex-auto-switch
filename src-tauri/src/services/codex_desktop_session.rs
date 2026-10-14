@@ -27,9 +27,11 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(3);
 const REOPENED_CHAT_TIMEOUT: Duration = Duration::from_secs(90);
 const OWNER_REFOLLOW_INTERVAL: Duration = Duration::from_secs(1);
 const GUARDED_READ_SLICE: Duration = Duration::from_millis(500);
+const PRE_QUIT_OBSERVATION_BUDGET: Duration = Duration::from_millis(50);
 const MAX_CANDIDATES: usize = 5000;
 const RESUME_TEXT: &str = "[CC Switch：恢复原任务] 本次换号前由 CC Switch 暂停了此任务，现已重开桌面。请检查中断现场和最后一次工具调用，继续此前尚未完成的原任务；保留原项目、模型和权限。结果不明确的操作先核对状态，不重复已完成的操作，原有审批仍需按规则处理。";
 const QUOTA_RESUME_TEXT: &str = "[CC Switch：恢复原任务] 此任务因账号额度耗尽而停止，CC Switch 已完成换号并重开桌面。请检查中断现场和最后一次工具调用，继续此前尚未完成的原任务；保留原项目、模型和权限。结果不明确的操作先核对状态，不重复已完成的操作，原有审批仍需按规则处理。";
+const DESKTOP_SHUTDOWN_RESUME_TEXT: &str = "[CC Switch：恢复原任务] 本次换号前此任务仍在运行，因正常退出 Codex 而中断，现已完成换号并重开桌面。请检查中断现场和最后一次工具调用，继续此前尚未完成的原任务；保留原项目、模型和权限。结果不明确的操作先核对状态，不重复已完成的操作，原有审批仍需按规则处理。";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -199,11 +201,31 @@ impl TaskSnapshot {
                     && paused.turn_ended_at_ms.is_some()
                     && self.turn_ended_at_ms == paused.turn_ended_at_ms
             }
+            // A pre-quit snapshot is not proof of an interrupt in the old
+            // desktop. This ticket is usable only after a verified restart.
+            RecoveryOrigin::DesktopShutdown => false,
         }
     }
 
     fn matches_reopened_recovery_origin(&self, paused: &PausedTask) -> bool {
-        if paused.origin == RecoveryOrigin::QuotaExhausted && paused.saved_settings.is_some() {
+        if paused.origin == RecoveryOrigin::DesktopShutdown {
+            !paused.confirmed_by_cc_switch
+                && paused.saved_settings.is_some()
+                && self.turn_id.is_some()
+                && !self.waiting
+                && !self.is_child
+                && !self.ephemeral
+                && matches!(self.runtime_status.as_str(), "idle" | "notLoaded" | "systemError")
+                // Persisted desktop shutdowns can retain inProgress even
+                // though the reopened runtime has no executing turn. An active
+                // runtime, approval, completion or different turn is rejected.
+                && (matches!(self.status.as_deref(), Some("interrupted" | "inProgress"))
+                    // This exact whitelisted turn was running at capture. It
+                    // may exhaust quota during exit; ownership survives a long
+                    // reset wait without reviving unrelated old failures.
+                    || self.safely_quota_failed())
+        } else if paused.origin == RecoveryOrigin::QuotaExhausted && paused.saved_settings.is_some()
+        {
             // The desktop reconstructs durationMs when it loads a persisted
             // failed turn, so start + duration is not a stable identity across
             // restarts. Its saved time proves freshness at capture only. The
@@ -233,6 +255,7 @@ pub enum RecoveryOrigin {
     #[default]
     CcSwitchPause,
     QuotaExhausted,
+    DesktopShutdown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +272,14 @@ pub struct PausedTask {
     pub turn_ended_at_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_settings: Option<SavedTaskSettings>,
+}
+
+impl PausedTask {
+    pub fn is_desktop_shutdown_ticket(&self) -> bool {
+        self.origin == RecoveryOrigin::DesktopShutdown
+            && !self.confirmed_by_cc_switch
+            && self.saved_settings.is_some()
+    }
 }
 
 /// Bounded thread-local selections, never login data or conversation content.
@@ -508,6 +539,96 @@ impl DesktopSession {
             ));
         }
         self.saved_settings_for(&task.thread_id).map(|_| ())
+    }
+
+    /// Save this already received metadata snapshot without interrupting the
+    /// turn or requesting another owner snapshot. The bridge journals the
+    /// resulting whitelist before normally exiting the desktop.
+    pub fn capture_restart_task(
+        &self,
+        expected: &TaskSnapshot,
+        operation_id: &str,
+    ) -> Result<PausedTask, SessionError> {
+        validate_id(operation_id)?;
+        if self.broken || !self.compatible || self.resync_needed.contains(&expected.thread_id) {
+            return Err(SessionError::new(
+                SessionErrorKind::Unknown,
+                "保存退出恢复清单时桌面实时状态不可用",
+            ));
+        }
+        let current = self
+            .current_snapshot(&expected.thread_id)
+            .ok_or_else(|| SessionError::new(SessionErrorKind::Unknown, "原聊天实时状态不可用"))?;
+        if current != *expected || !(current.safely_running() || current.recent_quota_failure()) {
+            return Err(SessionError::new(
+                SessionErrorKind::StateChanged,
+                "保存退出恢复清单前原轮次、运行状态或设置已改变；未暂停任务",
+            ));
+        }
+        let saved_settings = self.saved_settings_for(&current.thread_id)?;
+        let origin = if current.safely_running() {
+            RecoveryOrigin::DesktopShutdown
+        } else {
+            RecoveryOrigin::QuotaExhausted
+        };
+        Ok(PausedTask {
+            thread_id: current.thread_id,
+            turn_id: current.turn_id.unwrap(),
+            context: current.context,
+            pause_operation_id: operation_id.into(),
+            confirmed_by_cc_switch: false,
+            origin,
+            turn_ended_at_ms: current.turn_ended_at_ms,
+            saved_settings: Some(saved_settings),
+        })
+    }
+
+    /// Drain only the existing subscription briefly before exit. Never discover
+    /// more chats, refollow owners, wait per chat, or send interrupt requests.
+    /// Observed user stops/completions/approvals/new turns are removed from the
+    /// saved whitelist rather than being mistaken for desktop shutdowns later.
+    pub async fn observe_restart_candidates_before_quit(
+        &mut self,
+        tickets: &[PausedTask],
+    ) -> Result<Vec<String>, SessionError> {
+        if tickets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let deadline = tokio::time::Instant::now() + PRE_QUIT_OBSERVATION_BUDGET;
+        while tokio::time::Instant::now() < deadline {
+            match self.pump_until(deadline).await? {
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let mut excluded = Vec::new();
+        for ticket in tickets {
+            // A partial queued frame can contain a stop/change not yet reduced
+            // to metadata. Do not retain an old whitelist on that uncertainty.
+            let unchanged = self.receive_buffer.is_empty()
+                && !self.broken
+                && self.compatible
+                && !self.resync_needed.contains(&ticket.thread_id)
+                && self
+                    .current_snapshot(&ticket.thread_id)
+                    .is_some_and(|current| {
+                        current.turn_id.as_deref() == Some(ticket.turn_id.as_str())
+                            && current.context == ticket.context
+                            && match ticket.origin {
+                                RecoveryOrigin::DesktopShutdown => {
+                                    current.safely_running() || current.recent_quota_failure()
+                                }
+                                RecoveryOrigin::QuotaExhausted => current.matches_paused(ticket),
+                                RecoveryOrigin::CcSwitchPause => false,
+                            }
+                    });
+            if !unchanged {
+                excluded.push(ticket.thread_id.clone());
+            }
+        }
+        excluded.sort();
+        excluded.dedup();
+        Ok(excluded)
     }
 
     /// Own a recovery ticket for this exact quota failure without pretending
@@ -906,10 +1027,14 @@ impl DesktopSession {
                 "本次恢复曾发送过，需核对新轮次，未重复发送",
             ));
         }
+        let mut params = resume_params(paused, operation_id);
+        if paused.origin == RecoveryOrigin::DesktopShutdown && current.safely_quota_failed() {
+            params["turnStart"]["request"]["input"][0]["text"] = json!(QUOTA_RESUME_TEXT);
+        }
         let _reply = self
             .request(
                 "thread-follower-start-turn",
-                resume_params(paused, operation_id),
+                params,
                 Some(&current.owner),
                 true,
             )
@@ -1240,7 +1365,18 @@ impl DesktopSession {
                     })?;
                     self.receive_buffer.drain(..length + 4);
                     if message["type"] == "client-discovery-request" {
-                        self.send(&json!({"type":"client-discovery-response","requestId":message["requestId"],"response":{"canHandle":false}}), false).await?;
+                        let response = json!({"type":"client-discovery-response","requestId":message["requestId"],"response":{"canHandle":false}});
+                        match tokio::time::timeout_at(deadline, self.send(&response, false)).await {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                self.broken = true;
+                                self.states.clear();
+                                return Err(SessionError::new(
+                                    SessionErrorKind::Unavailable,
+                                    "桌面协调发现响应超出本次状态观察时间；连接已停用",
+                                ));
+                            }
+                        }
                     } else {
                         self.ingest(&message)?;
                     }
@@ -1524,6 +1660,7 @@ fn resume_params(paused: &PausedTask, operation_id: &str) -> Value {
     let text = match paused.origin {
         RecoveryOrigin::CcSwitchPause => RESUME_TEXT,
         RecoveryOrigin::QuotaExhausted => QUOTA_RESUME_TEXT,
+        RecoveryOrigin::DesktopShutdown => DESKTOP_SHUTDOWN_RESUME_TEXT,
     };
     let mut result = json!({"conversationId":paused.thread_id,"turnStart":{"request":{"threadId":paused.thread_id,"input":[{"type":"text","text":text,"text_elements":[]}],"clientUserMessageId":operation_id},"context":{"inheritThreadSettings":true,"usePermissionSelection":false,"useAppServerPermissionDefault":false}}});
     if let Some(saved) = &paused.saved_settings {
@@ -1581,7 +1718,9 @@ fn reopened_chat_is_loading(metadata: &Value, current: &TaskSnapshot, paused: &P
     if current.waiting
         || current.is_child
         || current.ephemeral
-        || current.status.as_deref() == Some("inProgress")
+        || (current.status.as_deref() == Some("inProgress")
+            && (paused.origin != RecoveryOrigin::DesktopShutdown
+                || current.runtime_status == "active"))
         || current
             .turn_id
             .as_deref()
@@ -3334,6 +3473,275 @@ mod tests {
         (session, task)
     }
 
+    fn shutdown_ticket() -> PausedTask {
+        let (session, task) = saved_retry_state(&state("inProgress"));
+        session.capture_restart_task(&task, OP).unwrap()
+    }
+
+    #[tokio::test]
+    async fn restart_capture_saves_exact_settings_without_interrupt_or_owner_requests() {
+        let original = state("inProgress");
+        let (mut session, task) = saved_retry_state(&original);
+        let (client, mut server) = tokio::io::duplex(8192);
+        session.io = Box::new(client);
+        let ticket = session.capture_restart_task(&task, OP).unwrap();
+        assert_eq!(ticket.origin, RecoveryOrigin::DesktopShutdown);
+        assert!(!ticket.confirmed_by_cc_switch);
+        assert_eq!(ticket.context, task.context);
+        assert_eq!(ticket.turn_id, task.turn_id.unwrap());
+        assert_eq!(
+            ticket.saved_settings.as_ref().unwrap(),
+            &capture_saved_settings(&original).unwrap()
+        );
+        assert!(session.mutation_attempts.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), read_frame(&mut server))
+                .await
+                .is_err()
+        );
+        let encoded = serde_json::to_string(&ticket).unwrap();
+        assert!(encoded.contains("desktopShutdown"));
+        assert!(!encoded.contains("private user text"));
+        assert!(!encoded.contains("private tool output"));
+        let params = resume_params(&ticket, OP);
+        assert_eq!(
+            params["turnStart"]["request"]["input"][0]["text"],
+            DESKTOP_SHUTDOWN_RESUME_TEXT
+        );
+        assert_eq!(params["turnStart"]["request"]["model"], "model");
+        assert_eq!(params["turnStart"]["request"]["effort"], "high");
+        assert_eq!(
+            params["turnStart"]["request"]["runtimeWorkspaceRoots"],
+            original["currentPermissions"]["runtimeWorkspaceRoots"]
+        );
+    }
+
+    #[test]
+    fn restart_capture_keeps_recent_quota_origin_and_rejects_old_or_user_stopped_work() {
+        let (session, task) = saved_retry_state(&quota_failed_state());
+        let ticket = session.capture_restart_task(&task, OP).unwrap();
+        assert_eq!(ticket.origin, RecoveryOrigin::QuotaExhausted);
+        assert_eq!(ticket.turn_ended_at_ms, task.turn_ended_at_ms);
+        assert!(!ticket.confirmed_by_cc_switch);
+        for status in ["interrupted", "completed", "failed"] {
+            let (session, task) = saved_retry_state(&state(status));
+            assert_eq!(
+                session.capture_restart_task(&task, OP).unwrap_err().kind,
+                SessionErrorKind::StateChanged
+            );
+        }
+        let mut old = quota_failed_state();
+        old["turns"][0]["turnStartedAtMs"] = json!(wall_clock_ms().unwrap() - 60 * 60 * 1000);
+        let (session, task) = saved_retry_state(&old);
+        assert!(session.capture_restart_task(&task, OP).is_err());
+        let mut approval = state("inProgress");
+        approval["requests"] = json!([{"method":"item/commandExecution/requestApproval"}]);
+        let (session, task) = saved_retry_state(&approval);
+        assert!(session.capture_restart_task(&task, OP).is_err());
+    }
+
+    #[test]
+    fn restart_capture_rejects_changed_snapshot_missing_settings_and_invalid_connection() {
+        let (mut session, task) = saved_retry_state(&state("inProgress"));
+        let mut changed = task.clone();
+        changed.turn_id = Some("new-user-turn".into());
+        assert!(session.capture_restart_task(&changed, OP).is_err());
+        let mut changed = task.clone();
+        changed.context.model = Some("user-selected-model".into());
+        assert!(session.capture_restart_task(&changed, OP).is_err());
+        session.states.get_mut(THREAD).unwrap().metadata["latestThreadSettings"] = Value::Null;
+        let current = session.current_snapshot(THREAD).unwrap();
+        assert_eq!(
+            session.capture_restart_task(&current, OP).unwrap_err().kind,
+            SessionErrorKind::Blocked
+        );
+        let (mut session, task) = saved_retry_state(&state("inProgress"));
+        session.resync_needed.insert(THREAD.into());
+        assert_eq!(
+            session.capture_restart_task(&task, OP).unwrap_err().kind,
+            SessionErrorKind::Unknown
+        );
+        session.resync_needed.clear();
+        session.broken = true;
+        assert!(session.capture_restart_task(&task, OP).is_err());
+    }
+
+    #[tokio::test]
+    async fn pre_quit_observation_excludes_user_stops_completion_approval_and_new_turn() {
+        for changed_case in 0..6 {
+            let (mut session, task) = saved_retry_state(&state("inProgress"));
+            let ticket = session.capture_restart_task(&task, OP).unwrap();
+            let (client, mut server) = tokio::io::duplex(8192);
+            session.io = Box::new(client);
+            let mut changed = state("inProgress");
+            match changed_case {
+                0 => {
+                    changed["turns"][0]["status"] = json!("interrupted");
+                    changed["threadRuntimeStatus"]["type"] = json!("idle");
+                }
+                1 => {
+                    changed["turns"][0]["status"] = json!("completed");
+                    changed["threadRuntimeStatus"]["type"] = json!("idle");
+                }
+                2 => {
+                    changed["requests"] =
+                        json!([{"method":"item/commandExecution/requestApproval"}])
+                }
+                3 => changed["turns"][0]["turnId"] = json!("new-user-turn"),
+                4 => changed["latestModel"] = json!("user-selected-model"),
+                5 => changed["unconfirmedTurnSubmissions"] = json!([{}]),
+                _ => unreachable!(),
+            }
+            let frame = json!({"type":"broadcast","sourceClientId":"new-owner",
+                "method":"thread-stream-state-changed","version":11,
+                "params":{"hostId":"local","conversationId":THREAD,"change":{
+                    "type":"snapshot","revision":2,"conversationState":changed}}});
+            write_frame(&mut server, frame).await;
+            let excluded = session
+                .observe_restart_candidates_before_quit(&[ticket])
+                .await
+                .unwrap();
+            assert_eq!(excluded, vec![THREAD.to_owned()], "case {changed_case}");
+            assert!(session.mutation_attempts.is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_millis(1), read_frame(&mut server))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_quit_observation_preserves_unchanged_running_and_quota_without_requests() {
+        for original in [state("inProgress"), quota_failed_state()] {
+            let (mut session, task) = saved_retry_state(&original);
+            let ticket = session.capture_restart_task(&task, OP).unwrap();
+            let (client, _server) = tokio::io::duplex(8192);
+            session.io = Box::new(client);
+            assert!(session
+                .observe_restart_candidates_before_quit(&[ticket.clone()])
+                .await
+                .unwrap()
+                .is_empty());
+            session
+                .receive_buffer
+                .extend_from_slice(&[10, 0, 0, 0, b'{']);
+            assert_eq!(
+                session
+                    .observe_restart_candidates_before_quit(&[ticket])
+                    .await
+                    .unwrap(),
+                vec![THREAD.to_owned()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn running_to_quota_exit_race_keeps_only_same_recent_quota_turn_in_whitelist() {
+        for changed_case in 0..5 {
+            let (mut session, task) = saved_retry_state(&state("inProgress"));
+            let ticket = session.capture_restart_task(&task, OP).unwrap();
+            let (client, mut server) = tokio::io::duplex(8192);
+            session.io = Box::new(client);
+            let mut changed = quota_failed_state();
+            match changed_case {
+                0 => {}
+                1 => changed["turns"][0]["turnId"] = json!("new-user-turn"),
+                2 => changed["latestModel"] = json!("user-selected-model"),
+                3 => changed["turns"][0]["error"]["codexErrorInfo"] = json!("serverOverloaded"),
+                4 => changed["turns"][0]["turnStartedAtMs"] = json!(wall_clock_ms().unwrap() - 60 * 60 * 1000),
+                _ => unreachable!(),
+            }
+            write_frame(&mut server, json!({"type":"broadcast","sourceClientId":"new-owner",
+                "method":"thread-stream-state-changed","version":11,
+                "params":{"hostId":"local","conversationId":THREAD,"change":{
+                    "type":"snapshot","revision":2,"conversationState":changed}}})).await;
+            let excluded = session.observe_restart_candidates_before_quit(&[ticket.clone()]).await.unwrap();
+            if changed_case == 0 {
+                assert!(excluded.is_empty());
+                let current = session.current_snapshot(THREAD).unwrap();
+                assert!(matches_reopened_pause(&current, &ticket));
+                assert!(!current.matches_paused(&ticket));
+            } else {
+                assert_eq!(excluded, vec![THREAD.to_owned()], "case {changed_case}");
+                if changed_case != 4 {
+                    assert!(!matches_reopened_pause(&session.current_snapshot(THREAD).unwrap(), &ticket));
+                }
+            }
+            assert!(session.mutation_attempts.is_empty());
+        }
+    }
+
+    #[test]
+    fn same_shutdown_quota_turn_remains_owned_after_long_reset_wait() {
+        let ticket = shutdown_ticket();
+        let mut old = quota_failed_state();
+        old["turns"][0]["turnStartedAtMs"] = json!(wall_clock_ms().unwrap() - 6 * 60 * 60 * 1000);
+        let (_, current) = saved_retry_state(&old);
+        assert!(!current.recent_quota_failure());
+        assert!(matches_reopened_pause(&current, &ticket));
+    }
+
+    #[test]
+    fn reopened_shutdown_ticket_requires_exact_owned_turn_and_no_executing_runtime() {
+        let ticket = shutdown_ticket();
+        for status in ["interrupted", "inProgress"] {
+            for runtime in ["idle", "notLoaded", "systemError"] {
+                let mut value = state(status);
+                value["threadRuntimeStatus"]["type"] = json!(runtime);
+                let (_, current) = saved_retry_state(&value);
+                assert!(!current.matches_paused(&ticket));
+                assert!(
+                    matches_reopened_pause(&current, &ticket),
+                    "{status}/{runtime}"
+                );
+                for changed_case in 0..6 {
+                    let mut changed = current.clone();
+                    match changed_case {
+                        0 => changed.runtime_status = "active".into(),
+                        1 => changed.status = Some("completed".into()),
+                        2 => changed.waiting = true,
+                        3 => changed.turn_id = Some("new-user-turn".into()),
+                        4 => changed.context.cwd = Some("C:/different-project".into()),
+                        5 => changed.context.model = Some("different-model".into()),
+                        _ => unreachable!(),
+                    }
+                    assert!(
+                        !matches_reopened_pause(&changed, &ticket),
+                        "case {changed_case}"
+                    );
+                }
+            }
+        }
+        let mut forged = ticket;
+        forged.confirmed_by_cc_switch = true;
+        let (_, current) = saved_retry_state(&state("interrupted"));
+        assert!(!matches_reopened_pause(&current, &forged));
+    }
+
+    #[test]
+    fn shutdown_residual_in_progress_may_hydrate_but_active_and_user_decisions_never_do() {
+        let ticket = shutdown_ticket();
+        let mut value = state("inProgress");
+        value["resumeState"] = json!("needs_resume");
+        value["threadRuntimeStatus"]["type"] = json!("unknown");
+        let metadata = project_at(&[], &value).unwrap();
+        let current = summarize(&metadata, "new-owner").unwrap();
+        assert!(reopened_chat_is_loading(&metadata, &current, &ticket));
+        for changed_case in 0..4 {
+            let mut changed = current.clone();
+            match changed_case {
+                0 => changed.runtime_status = "active".into(),
+                1 => changed.waiting = true,
+                2 => changed.status = Some("completed".into()),
+                3 => changed.turn_id = Some("new-user-turn".into()),
+                _ => unreachable!(),
+            }
+            assert!(!reopened_chat_is_loading(&metadata, &changed, &ticket));
+        }
+        assert!(!reopened_chat_is_loading(&metadata, &current, &paused()));
+    }
+
     #[test]
     fn saved_retry_requires_owned_stopped_turn_and_current_live_snapshot() {
         let original = state("interrupted");
@@ -4752,6 +5160,10 @@ mod tests {
         let quota_failed = initial_status == "quotaFailed";
         let mut current = if quota_failed {
             quota_failed_state()
+        } else if initial_status == "shutdownResidual" {
+            let mut residual = state("inProgress");
+            residual["threadRuntimeStatus"]["type"] = json!("idle");
+            residual
         } else {
             state(initial_status)
         };
@@ -4826,6 +5238,38 @@ mod tests {
             start_count
         });
         (session, handle)
+    }
+
+    #[tokio::test]
+    async fn shutdown_ticket_restores_exact_saved_chat_once_after_reopened_baseline() {
+        for status in ["interrupted", "shutdownResidual", "quotaFailed"] {
+            let ticket = shutdown_ticket();
+            let (mut session, owner) = mock_owner(status, true);
+            let current = session
+                .wait_for_reopened_paused_chat(&ticket, || true)
+                .await
+                .unwrap();
+            assert_eq!(current.turn_id.as_deref(), Some(ticket.turn_id.as_str()));
+            session.can_retry_saved_task(&current, &ticket).unwrap();
+            let resumed = session
+                .resume_and_confirm(&ticket, OP, || true)
+                .await
+                .unwrap();
+            assert_eq!(resumed.turn_id, "restored-turn");
+            assert!(
+                session
+                    .resume_and_confirm(&ticket, OP, || true)
+                    .await
+                    .unwrap()
+                    .already_observed
+            );
+            assert!(session
+                .mutation_attempts
+                .iter()
+                .all(|key| key.starts_with("resume:")));
+            drop(session);
+            assert_eq!(owner.await.unwrap(), 1);
+        }
     }
 
     #[tokio::test]

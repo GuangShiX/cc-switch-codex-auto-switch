@@ -28,7 +28,8 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::hash::{Hash, Hasher};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
@@ -52,7 +53,7 @@ struct CumulativeTokens {
 }
 
 /// 单次 API 调用的 token 增量
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DeltaTokens {
     input: u32,
     cached_input: u32,
@@ -80,7 +81,7 @@ struct TokenUsageSignature {
     last: Option<TokenCountersSignature>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TimestampedTokenSignature {
     timestamp: DateTime<Utc>,
     signature: TokenUsageSignature,
@@ -118,6 +119,22 @@ impl ParentFileStamp {
             file_id,
         })
     }
+
+    fn same_file(&self, other: &Self) -> bool {
+        #[cfg(windows)]
+        {
+            self.volume_serial == other.volume_serial && self.file_id == other.file_id
+        }
+        #[cfg(unix)]
+        {
+            self.device == other.device && self.inode == other.inode
+        }
+        #[cfg(not(any(windows, unix)))]
+        {
+            let _ = other;
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -139,7 +156,7 @@ fn windows_file_identity(file: &fs::File) -> Option<(u64, [u8; 16])> {
     ))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParentTokenTimeline {
     events: Vec<TimestampedTokenSignature>,
     max_timestamp: Option<DateTime<Utc>>,
@@ -180,6 +197,11 @@ impl ParentTokenTimeline {
 struct CachedParentTimeline {
     stamp: ParentFileStamp,
     timeline: Arc<ParentTokenTimeline>,
+    resume_bytes: u64,
+    resume_events: usize,
+    resume_max_timestamp: Option<DateTime<Utc>>,
+    resume_missing_timestamp: bool,
+    boundary_fingerprint: u64,
 }
 
 #[derive(Debug)]
@@ -187,9 +209,10 @@ struct CachedReplayPrefix {
     modified: i64,
     size: u64,
     prefix: usize,
+    parent_files: Vec<(PathBuf, ParentFileStamp)>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedTokenEvent {
     line_offset: i64,
     signature: TokenUsageSignature,
@@ -199,14 +222,14 @@ struct ParsedTokenEvent {
     timestamp: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ParentResolution {
     None,
     Parent(String),
     Deferred(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ParsedCodexFile {
     root_thread_id: Option<String>,
     /// root `session_meta` 的线程 ID（稳定逻辑线程）：单段文件名与文件名
@@ -217,12 +240,38 @@ struct ParsedCodexFile {
     parent: ParentResolution,
     token_events: Vec<ParsedTokenEvent>,
     line_offset: i64,
-    /// Bytes actually read, including an incomplete final record. Persisted in
-    /// `last_byte_offset` only to detect file changes, never used as a seek
-    /// position: parsing restarts at the beginning and `line_offset` tracks
-    /// consumed records so an incomplete tail can be retried after an append.
+    /// Bytes observed, including an incomplete final record. The durable cursor
+    /// still detects changes; the in-memory checkpoint seeks only to complete
+    /// newline boundaries, keeping an incomplete/unterminated tail retryable.
     observed_bytes: i64,
     has_billable_tokens: bool,
+    resume: CodexParserCheckpoint,
+    resume_bytes: u64,
+    resume_events: usize,
+    #[cfg(test)]
+    bytes_read: u64,
+}
+
+#[derive(Debug, Clone)]
+struct CodexParserCheckpoint {
+    meta_thread_id: Option<String>,
+    root_meta_seen: bool,
+    root_timestamp: Option<DateTime<Utc>>,
+    parent: ParentResolution,
+    current_model: String,
+    total_high_water: Option<CumulativeTokens>,
+    last_signature_by_source: HashMap<Option<String>, TokenUsageSignature>,
+    previous_token_signature: Option<TokenUsageSignature>,
+    event_index: u32,
+    line_offset: i64,
+    has_billable_tokens: bool,
+}
+
+#[derive(Debug)]
+struct CachedParsedCodexFile {
+    stamp: ParentFileStamp,
+    boundary_fingerprint: u64,
+    parsed: Arc<ParsedCodexFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +279,11 @@ enum PendingReason {
     MissingParent(String),
     Stable(String),
     Retryable(String),
+    ParentDependency {
+        parent_id: String,
+        files: Vec<(PathBuf, ParentFileStamp)>,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +291,7 @@ struct PendingEntry {
     modified: i64,
     size: u64,
     reason: PendingReason,
+    child_stamp: Option<ParentFileStamp>,
 }
 
 #[derive(Debug, Default)]
@@ -244,6 +299,7 @@ struct CodexReplayCaches {
     parent_timelines: HashMap<PathBuf, CachedParentTimeline>,
     replay_prefixes: HashMap<PathBuf, CachedReplayPrefix>,
     pending: HashMap<PathBuf, PendingEntry>,
+    parsed_files: HashMap<PathBuf, CachedParsedCodexFile>,
 }
 
 static CODEX_REPLAY_CACHES: OnceLock<Mutex<CodexReplayCaches>> = OnceLock::new();
@@ -682,6 +738,7 @@ struct CodexFileSyncResult {
     skipped: u32,
     suspected_duplicates: u32,
     deferred: bool,
+    newly_deferred: bool,
 }
 
 /// 同步 Codex 使用数据（从 JSONL 会话日志）
@@ -699,10 +756,12 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         deferred_files: 0,
         errors: vec![],
     };
+    let mut newly_deferred = false;
 
     for file_path in &files {
         match sync_single_codex_file(db, file_path, &rollout_index, &mut pass) {
             Ok(file_result) => {
+                newly_deferred |= file_result.newly_deferred;
                 result.imported = result.imported.saturating_add(file_result.imported);
                 result.skipped = result.skipped.saturating_add(file_result.skipped);
                 result.suspected_duplicates = result
@@ -720,7 +779,7 @@ pub fn sync_codex_usage(db: &Database) -> Result<SessionSyncResult, AppError> {
         }
     }
 
-    if result.imported > 0 || result.deferred_files > 0 {
+    if result.imported > 0 || newly_deferred {
         log::info!(
             "[CODEX-SYNC] 同步完成: 导入 {} 条, 跳过 {} 条, deferred {} 个, 扫描 {} 个文件",
             result.imported,
@@ -790,13 +849,208 @@ fn collect_jsonl_recursive(dir: &Path, files: &mut Vec<PathBuf>, depth: u32, max
     }
 }
 
+const CODEX_CACHE_ENTRY_LIMIT: usize = 256;
+const CODEX_CACHE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Read small head/boundary guards, never chat contents into the cache. File
+/// identity, monotonic size and these guards distinguish normal appends from
+/// replacement/truncation and common in-place rewrites; other changes fall back
+/// to the established full parser and durable line/request-id deduplication.
+fn prefix_boundary_fingerprint(file: &mut fs::File, boundary: u64) -> std::io::Result<u64> {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    boundary.hash(&mut hash);
+    for start in [0, boundary.saturating_sub(4096)] {
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = vec![0; (boundary - start).min(4096) as usize];
+        file.read_exact(&mut bytes)?;
+        bytes.hash(&mut hash);
+    }
+    Ok(hash.finish())
+}
+
+fn parsed_cache_bytes(parsed: &ParsedCodexFile) -> usize {
+    parsed
+        .token_events
+        .iter()
+        .map(|event| event.model.capacity() + event.timestamp.as_ref().map_or(0, String::capacity))
+        .sum::<usize>()
+        + parsed.token_events.capacity() * 512
+        + parsed
+            .resume
+            .last_signature_by_source
+            .keys()
+            .map(|source| source.as_ref().map_or(0, String::capacity))
+            .sum::<usize>()
+        + parsed.resume.last_signature_by_source.capacity() * 512
+        + parsed.resume.current_model.capacity()
+        + parsed.root_thread_id.as_ref().map_or(0, String::capacity)
+        + parsed.meta_thread_id.as_ref().map_or(0, String::capacity)
+        + parsed
+            .resume
+            .meta_thread_id
+            .as_ref()
+            .map_or(0, String::capacity)
+        + parent_resolution_cache_bytes(&parsed.parent)
+        + parent_resolution_cache_bytes(&parsed.resume.parent)
+        + 4096
+}
+
+fn parent_resolution_cache_bytes(parent: &ParentResolution) -> usize {
+    match parent {
+        ParentResolution::None => 0,
+        ParentResolution::Parent(value) | ParentResolution::Deferred(value) => value.capacity(),
+    }
+}
+
+// PathBuf capacity uses native string units. Two bytes per unit conservatively
+// covers Windows UTF-16 and also bounds Unix paths without allocating a copy.
+fn path_cache_bytes(path: &PathBuf) -> usize {
+    path.capacity() * 2
+}
+
+fn dependency_cache_bytes(files: &Vec<(PathBuf, ParentFileStamp)>) -> usize {
+    files.capacity() * std::mem::size_of::<(PathBuf, ParentFileStamp)>()
+        + files
+            .iter()
+            .map(|(path, _)| path_cache_bytes(path))
+            .sum::<usize>()
+}
+
+fn pending_cache_bytes(entry: &PendingEntry) -> usize {
+    256 + match &entry.reason {
+        PendingReason::MissingParent(value)
+        | PendingReason::Stable(value)
+        | PendingReason::Retryable(value) => value.capacity(),
+        PendingReason::ParentDependency {
+            parent_id,
+            files,
+            reason,
+        } => parent_id.capacity() + reason.capacity() + dependency_cache_bytes(files),
+    }
+}
+
+fn codex_cache_entry_count(caches: &CodexReplayCaches) -> usize {
+    caches.parsed_files.len()
+        + caches.parent_timelines.len()
+        + caches.replay_prefixes.len()
+        + caches.pending.len()
+}
+
+fn codex_cache_bytes(caches: &CodexReplayCaches) -> usize {
+    // Include all four maps, their reserved buckets, key paths and dependency
+    // metadata; otherwise deferred files could evade the advertised byte cap.
+    (caches.parsed_files.capacity()
+        + caches.parent_timelines.capacity()
+        + caches.replay_prefixes.capacity()
+        + caches.pending.capacity())
+        * 512
+        + caches
+            .parsed_files
+            .iter()
+            .map(|(path, entry)| path_cache_bytes(path) + parsed_cache_bytes(&entry.parsed))
+            .sum::<usize>()
+        + caches
+            .parent_timelines
+            .iter()
+            .map(|(path, entry)| {
+                path_cache_bytes(path) + entry.timeline.events.capacity() * 512 + 4096
+            })
+            .sum::<usize>()
+        + caches
+            .replay_prefixes
+            .iter()
+            .map(|(path, entry)| {
+                path_cache_bytes(path) + dependency_cache_bytes(&entry.parent_files)
+            })
+            .sum::<usize>()
+        + caches
+            .pending
+            .iter()
+            .map(|(path, entry)| path_cache_bytes(path) + pending_cache_bytes(entry))
+            .sum::<usize>()
+}
+
+fn trim_replay_caches(caches: &mut CodexReplayCaches) {
+    let mut bytes = codex_cache_bytes(caches);
+    let mut trimmed = false;
+    while codex_cache_entry_count(caches) > CODEX_CACHE_ENTRY_LIMIT
+        || bytes > CODEX_CACHE_BYTE_LIMIT
+    {
+        trimmed = true;
+        if let Some(path) = caches.parsed_files.keys().next().cloned() {
+            let entry = caches.parsed_files.remove(&path).unwrap();
+            let size = path_cache_bytes(&path) + parsed_cache_bytes(&entry.parsed);
+            bytes = bytes.saturating_sub(size);
+        } else if let Some(path) = caches.parent_timelines.keys().next().cloned() {
+            let entry = caches.parent_timelines.remove(&path).unwrap();
+            bytes = bytes.saturating_sub(
+                path_cache_bytes(&path) + entry.timeline.events.capacity() * 512 + 4096,
+            );
+        } else if let Some(path) = caches.replay_prefixes.keys().next().cloned() {
+            let entry = caches.replay_prefixes.remove(&path).unwrap();
+            bytes = bytes.saturating_sub(
+                path_cache_bytes(&path) + dependency_cache_bytes(&entry.parent_files),
+            );
+        } else if let Some(path) = caches.pending.keys().next().cloned() {
+            let entry = caches.pending.remove(&path).unwrap();
+            bytes = bytes.saturating_sub(path_cache_bytes(&path) + pending_cache_bytes(&entry));
+        } else {
+            break;
+        }
+    }
+    if trimmed {
+        caches.parsed_files.shrink_to_fit();
+        caches.parent_timelines.shrink_to_fit();
+        caches.replay_prefixes.shrink_to_fit();
+        caches.pending.shrink_to_fit();
+    }
+}
+
+fn parent_dependency_stamps(
+    parent_id: &str,
+    index: &RolloutIndex,
+) -> Option<Vec<(PathBuf, ParentFileStamp)>> {
+    index
+        .get(parent_id)?
+        .iter()
+        .map(|path| {
+            let file = fs::File::open(path).ok()?;
+            Some((path.clone(), ParentFileStamp::from_file(&file)?))
+        })
+        .collect()
+}
+
 fn parse_codex_file(
     file_path: &Path,
     root_thread_id: Option<String>,
-) -> Result<ParsedCodexFile, AppError> {
-    let file =
+) -> Result<Arc<ParsedCodexFile>, AppError> {
+    let mut file =
         fs::File::open(file_path).map_err(|e| AppError::Config(format!("无法打开文件: {e}")))?;
-    let mut reader = BufReader::new(file);
+    let stamp = ParentFileStamp::from_file(&file);
+    let previous = replay_caches()
+        .lock()
+        .ok()
+        .and_then(|mut caches| caches.parsed_files.remove(file_path));
+    let mut reusable = previous.filter(|entry| {
+        stamp.is_some_and(|current| {
+            current.same_file(&entry.stamp)
+                && current.size >= entry.stamp.size
+                && current.size >= entry.parsed.resume_bytes
+                && entry.parsed.root_thread_id == root_thread_id
+                && prefix_boundary_fingerprint(&mut file, entry.parsed.resume_bytes).ok()
+                    == Some(entry.boundary_fingerprint)
+                && (current.size > entry.stamp.size || current == entry.stamp)
+        })
+    });
+    if let Some(entry) = reusable.as_ref().filter(|entry| Some(entry.stamp) == stamp) {
+        let result = Arc::clone(&entry.parsed);
+        if let Ok(mut caches) = replay_caches().lock() {
+            caches
+                .parsed_files
+                .insert(file_path.into(), reusable.take().unwrap());
+        }
+        return Ok(result);
+    }
     let mut root_meta_seen = false;
     let mut root_timestamp = None;
     let mut meta_thread_id = None;
@@ -819,7 +1073,50 @@ fn parse_codex_file(
     let mut observed_bytes = 0i64;
     let mut has_billable_tokens = false;
 
+    let mut resume_bytes = 0;
+    let mut resume_events;
+    if let Some(entry) = reusable {
+        let previous = Arc::try_unwrap(entry.parsed).unwrap_or_else(|parsed| (*parsed).clone());
+        let checkpoint = previous.resume;
+        root_meta_seen = checkpoint.root_meta_seen;
+        root_timestamp = checkpoint.root_timestamp;
+        meta_thread_id = checkpoint.meta_thread_id;
+        parent = checkpoint.parent;
+        current_model = checkpoint.current_model;
+        total_high_water = checkpoint.total_high_water;
+        last_signature_by_source = checkpoint.last_signature_by_source;
+        previous_token_signature = checkpoint.previous_token_signature;
+        event_index = checkpoint.event_index;
+        line_offset = checkpoint.line_offset;
+        has_billable_tokens = checkpoint.has_billable_tokens;
+        token_events = previous.token_events;
+        token_events.truncate(previous.resume_events);
+        resume_bytes = previous.resume_bytes;
+        observed_bytes = resume_bytes as i64;
+    }
+    file.seek(SeekFrom::Start(resume_bytes))
+        .map_err(|e| AppError::Config(format!("无法定位 Codex 日志增量: {e}")))?;
+    let mut reader = BufReader::new(file);
+    #[cfg(test)]
+    let mut bytes_read = 0;
+    let mut resume;
+
     loop {
+        resume = CodexParserCheckpoint {
+            meta_thread_id: meta_thread_id.clone(),
+            root_meta_seen,
+            root_timestamp,
+            parent: parent.clone(),
+            current_model: current_model.clone(),
+            total_high_water: total_high_water.clone(),
+            last_signature_by_source: last_signature_by_source.clone(),
+            previous_token_signature: previous_token_signature.clone(),
+            event_index,
+            line_offset,
+            has_billable_tokens,
+        };
+        resume_bytes = observed_bytes as u64;
+        resume_events = token_events.len();
         let mut bytes = Vec::new();
         let read = reader
             .read_until(b'\n', &mut bytes)
@@ -827,6 +1124,10 @@ fn parse_codex_file(
         // Count the incomplete suffix too, so an unchanged crashed/closed
         // rollout is skipped rather than fully reparsed on every sync pass.
         observed_bytes += read as i64;
+        #[cfg(test)]
+        {
+            bytes_read += read as u64;
+        }
         // A live writer may have only written part of the final JSON record.
         // Leave its line cursor unconsumed for the next file change, but retain
         // support for a complete final JSON record without a newline.
@@ -836,31 +1137,41 @@ fn parse_codex_file(
         {
             break;
         }
+        let terminated = bytes.last() == Some(&b'\n');
+        macro_rules! skip_record {
+            () => {
+                if !terminated {
+                    break;
+                } else {
+                    continue;
+                }
+            };
+        }
         line_offset += 1;
         let line = match String::from_utf8(bytes) {
             Ok(line) => line,
-            Err(_) => continue,
+            Err(_) => skip_record!(),
         };
         if line.trim().is_empty() {
-            continue;
+            skip_record!();
         }
 
         let is_event_msg = line.contains("\"event_msg\"");
         let is_turn_context = line.contains("\"turn_context\"");
         let is_session_meta = line.contains("\"session_meta\"");
         if !is_event_msg && !is_turn_context && !is_session_meta {
-            continue;
+            skip_record!();
         }
         if is_event_msg && !line.contains("\"token_count\"") {
-            continue;
+            skip_record!();
         }
 
         let value: serde_json::Value = match serde_json::from_str(&line) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => skip_record!(),
         };
         let Some(event_type) = value.get("type").and_then(serde_json::Value::as_str) else {
-            continue;
+            skip_record!();
         };
 
         match event_type {
@@ -924,16 +1235,16 @@ fn parse_codex_file(
             }
             "event_msg" => {
                 let Some(payload) = value.get("payload") else {
-                    continue;
+                    skip_record!();
                 };
                 if payload.get("type").and_then(serde_json::Value::as_str) != Some("token_count") {
-                    continue;
+                    skip_record!();
                 }
                 let Some(info) = payload.get("info").filter(|info| !info.is_null()) else {
-                    continue;
+                    skip_record!();
                 };
                 let Some(signature) = parse_token_signature(info) else {
-                    continue;
+                    skip_record!();
                 };
 
                 if let Some(model) = info
@@ -953,7 +1264,7 @@ fn parse_codex_file(
                     .get("last_token_usage")
                     .and_then(parse_cumulative_tokens);
                 if total.is_none() && last.is_none() {
-                    continue;
+                    skip_record!();
                 }
                 let has_total_snapshot = total.is_some();
                 let duplicate_snapshot = has_total_snapshot
@@ -982,7 +1293,7 @@ fn parse_codex_file(
                 } else if let Some(total) = total.as_ref() {
                     compute_delta(&total_high_water, total)
                 } else {
-                    continue;
+                    skip_record!();
                 };
                 if let Some(total) = total {
                     if let Some(high_water) = total_high_water.as_mut() {
@@ -1017,9 +1328,12 @@ fn parse_codex_file(
             }
             _ => {}
         }
+        if !terminated {
+            break;
+        }
     }
 
-    Ok(ParsedCodexFile {
+    let parsed = Arc::new(ParsedCodexFile {
         root_thread_id,
         meta_thread_id,
         root_meta_seen,
@@ -1029,89 +1343,181 @@ fn parse_codex_file(
         line_offset,
         observed_bytes,
         has_billable_tokens,
-    })
+        resume,
+        resume_bytes,
+        resume_events,
+        #[cfg(test)]
+        bytes_read,
+    });
+    if let Some(stamp) = stamp {
+        let mut file = reader.into_inner();
+        if let Ok(boundary_fingerprint) =
+            prefix_boundary_fingerprint(&mut file, parsed.resume_bytes)
+        {
+            if let Ok(mut caches) = replay_caches().lock() {
+                caches.parsed_files.insert(
+                    file_path.into(),
+                    CachedParsedCodexFile {
+                        stamp,
+                        boundary_fingerprint,
+                        parsed: Arc::clone(&parsed),
+                    },
+                );
+                trim_replay_caches(&mut caches);
+            }
+        }
+    }
+    Ok(parsed)
 }
 
 fn parent_signatures_before(
     parent_path: &Path,
     cutoff: DateTime<Utc>,
 ) -> Result<Vec<TokenUsageSignature>, String> {
-    let file = fs::File::open(parent_path)
+    let mut file = fs::File::open(parent_path)
         .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
     let stamp = ParentFileStamp::from_file(&file);
-    let cached_timeline = stamp.and_then(|stamp| {
-        replay_caches().lock().ok().and_then(|caches| {
-            caches
-                .parent_timelines
-                .get(parent_path)
-                .filter(|entry| entry.stamp == stamp)
-                .map(|entry| Arc::clone(&entry.timeline))
+    let previous = replay_caches()
+        .lock()
+        .ok()
+        .and_then(|mut caches| caches.parent_timelines.remove(parent_path));
+    if let Some(previous) = previous
+        .as_ref()
+        .filter(|previous| Some(previous.stamp) == stamp)
+    {
+        let result = previous.timeline.signatures_before(parent_path, cutoff);
+        if let Ok(mut caches) = replay_caches().lock() {
+            caches.parent_timelines.insert(
+                parent_path.into(),
+                CachedParentTimeline {
+                    stamp: previous.stamp,
+                    timeline: Arc::clone(&previous.timeline),
+                    resume_bytes: previous.resume_bytes,
+                    resume_events: previous.resume_events,
+                    resume_max_timestamp: previous.resume_max_timestamp,
+                    resume_missing_timestamp: previous.resume_missing_timestamp,
+                    boundary_fingerprint: previous.boundary_fingerprint,
+                },
+            );
+        }
+        return result;
+    }
+    let reusable = previous.filter(|previous| {
+        stamp.is_some_and(|current| {
+            current.same_file(&previous.stamp)
+                && current.size > previous.stamp.size
+                && current.size >= previous.resume_bytes
+                && prefix_boundary_fingerprint(&mut file, previous.resume_bytes).ok()
+                    == Some(previous.boundary_fingerprint)
         })
     });
-    if let Some(timeline) = cached_timeline {
-        return timeline.signatures_before(parent_path, cutoff);
+    let mut timeline = ParentTokenTimeline {
+        events: Vec::new(),
+        max_timestamp: None,
+        has_token_without_timestamp: false,
+    };
+    let mut observed_bytes = 0;
+    if let Some(previous) = reusable {
+        timeline =
+            Arc::try_unwrap(previous.timeline).unwrap_or_else(|timeline| (*timeline).clone());
+        timeline.events.truncate(previous.resume_events);
+        timeline.max_timestamp = previous.resume_max_timestamp;
+        timeline.has_token_without_timestamp = previous.resume_missing_timestamp;
+        observed_bytes = previous.resume_bytes;
     }
-
-    let mut events = Vec::new();
-    let mut max_timestamp: Option<DateTime<Utc>> = None;
-    let mut has_token_without_timestamp = false;
-
-    // 必须扫描完整父文件，不能在首个未来时间戳处 break：rollout 写入顺序
-    // 不承诺时间戳严格单调。缓存完整时间线后，不同 child cutoff 只需内存过滤。
-    for line in BufReader::new(file).lines() {
-        let Ok(line) = line else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
+    file.seek(SeekFrom::Start(observed_bytes))
+        .map_err(|_| format!("无法定位父 rollout {} 的增量", parent_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let (
+        mut resume_bytes,
+        mut resume_events,
+        mut resume_max_timestamp,
+        mut resume_missing_timestamp,
+    );
+    loop {
+        resume_bytes = observed_bytes;
+        resume_events = timeline.events.len();
+        resume_max_timestamp = timeline.max_timestamp;
+        resume_missing_timestamp = timeline.has_token_without_timestamp;
+        let mut bytes = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut bytes)
+            .map_err(|_| format!("无法读取父 rollout {}", parent_path.display()))?;
+        observed_bytes += read as u64;
+        if read == 0 {
+            break;
+        }
+        let terminated = bytes.last() == Some(&b'\n');
+        macro_rules! skip_parent_record {
+            () => {
+                if !terminated {
+                    break;
+                } else {
+                    continue;
+                }
+            };
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            skip_parent_record!();
         };
         let timestamp = parse_timestamp(value.get("timestamp"));
         if let Some(timestamp) = timestamp {
-            max_timestamp = Some(max_timestamp.map_or(timestamp, |current| current.max(timestamp)));
+            timeline.max_timestamp = Some(
+                timeline
+                    .max_timestamp
+                    .map_or(timestamp, |current| current.max(timestamp)),
+            );
         }
         if value.get("type").and_then(serde_json::Value::as_str) != Some("event_msg")
             || value
-                .get("payload")
-                .and_then(|payload| payload.get("type"))
+                .pointer("/payload/type")
                 .and_then(serde_json::Value::as_str)
                 != Some("token_count")
         {
-            continue;
+            skip_parent_record!();
         }
         let Some(info) = value
-            .get("payload")
-            .and_then(|payload| payload.get("info"))
+            .pointer("/payload/info")
             .filter(|info| !info.is_null())
         else {
-            continue;
+            skip_parent_record!();
         };
         let Some(signature) = parse_token_signature(info) else {
-            continue;
+            skip_parent_record!();
         };
         let Some(timestamp) = timestamp else {
-            has_token_without_timestamp = true;
-            continue;
+            timeline.has_token_without_timestamp = true;
+            skip_parent_record!();
         };
-        events.push(TimestampedTokenSignature {
+        timeline.events.push(TimestampedTokenSignature {
             timestamp,
             signature,
         });
+        if !terminated {
+            break;
+        }
     }
-
-    let timeline = Arc::new(ParentTokenTimeline {
-        events,
-        max_timestamp,
-        has_token_without_timestamp,
-    });
+    let timeline = Arc::new(timeline);
     let result = timeline.signatures_before(parent_path, cutoff);
-    if let (Some(stamp), Ok(mut caches)) = (stamp, replay_caches().lock()) {
-        caches.parent_timelines.insert(
-            parent_path.to_path_buf(),
-            CachedParentTimeline {
-                stamp,
-                timeline: Arc::clone(&timeline),
-            },
-        );
+    if let Some(stamp) = stamp {
+        let mut file = reader.into_inner();
+        if let Ok(boundary_fingerprint) = prefix_boundary_fingerprint(&mut file, resume_bytes) {
+            if let Ok(mut caches) = replay_caches().lock() {
+                caches.parent_timelines.insert(
+                    parent_path.into(),
+                    CachedParentTimeline {
+                        stamp,
+                        timeline: Arc::clone(&timeline),
+                        resume_bytes,
+                        resume_events,
+                        resume_max_timestamp,
+                        resume_missing_timestamp,
+                        boundary_fingerprint,
+                    },
+                );
+                trim_replay_caches(&mut caches);
+            }
+        }
     }
     result
 }
@@ -1166,14 +1572,19 @@ fn mark_deferred(
         modified,
         size,
         reason,
+        child_stamp: fs::File::open(file_path)
+            .ok()
+            .and_then(|file| ParentFileStamp::from_file(&file)),
     };
     let should_warn = replay_caches()
         .lock()
         .ok()
         .and_then(|mut caches| {
-            caches
+            let previous = caches
                 .pending
-                .insert(file_path.to_path_buf(), entry.clone())
+                .insert(file_path.to_path_buf(), entry.clone());
+            trim_replay_caches(&mut caches);
+            previous
         })
         .as_ref()
         != Some(&entry);
@@ -1181,11 +1592,13 @@ fn mark_deferred(
         let reason = match &entry.reason {
             PendingReason::MissingParent(parent) => format!("找不到父 rollout {parent}"),
             PendingReason::Stable(reason) | PendingReason::Retryable(reason) => reason.clone(),
+            PendingReason::ParentDependency { reason, .. } => reason.clone(),
         };
         log::warn!("[CODEX-SYNC] deferred {}: {reason}", file_path.display());
     }
     CodexFileSyncResult {
         deferred: true,
+        newly_deferred: should_warn,
         ..CodexFileSyncResult::default()
     }
 }
@@ -1247,9 +1660,16 @@ fn sync_single_codex_file(
         return Ok(CodexFileSyncResult::default());
     }
 
-    if let Ok(mut caches) = replay_caches().lock() {
+    if let Ok(caches) = replay_caches().lock() {
         if let Some(pending) = caches.pending.get(file_path).cloned() {
-            if pending.modified == file_modified && pending.size == file_size {
+            let current_stamp = fs::File::open(file_path)
+                .ok()
+                .and_then(|file| ParentFileStamp::from_file(&file));
+            if pending.modified == file_modified
+                && pending.size == file_size
+                && current_stamp.is_some()
+                && pending.child_stamp == current_stamp
+            {
                 match &pending.reason {
                     PendingReason::MissingParent(parent) if !rollout_index.contains_key(parent) => {
                         return Ok(CodexFileSyncResult {
@@ -1263,12 +1683,17 @@ fn sync_single_codex_file(
                             ..CodexFileSyncResult::default()
                         });
                     }
-                    PendingReason::Retryable(_) => {
-                        caches.pending.remove(file_path);
+                    PendingReason::ParentDependency {
+                        parent_id, files, ..
+                    } if parent_dependency_stamps(parent_id, rollout_index).as_ref()
+                        == Some(files) =>
+                    {
+                        return Ok(CodexFileSyncResult {
+                            deferred: true,
+                            ..CodexFileSyncResult::default()
+                        });
                     }
-                    _ => {
-                        caches.pending.remove(file_path);
-                    }
+                    _ => {}
                 }
             }
         }
@@ -1317,11 +1742,16 @@ fn sync_single_codex_file(
                     ),
                 ));
             };
+            let parent_files = parent_dependency_stamps(parent_id, rollout_index);
             if let Ok(caches) = replay_caches().lock() {
                 if let Some(prefix) = caches
                     .replay_prefixes
                     .get(file_path)
-                    .filter(|cached| cached.modified == file_modified && cached.size == file_size)
+                    .filter(|cached| {
+                        cached.modified == file_modified
+                            && cached.size == file_size
+                            && parent_files.as_ref() == Some(&cached.parent_files)
+                    })
                     .map(|cached| cached.prefix)
                 {
                     prefix
@@ -1332,7 +1762,14 @@ fn sync_single_codex_file(
                             Ok(signatures) => signatures,
                             Err(reason) => {
                                 let pending_reason = if rollout_index.contains_key(parent_id) {
-                                    PendingReason::Retryable(reason)
+                                    match parent_dependency_stamps(parent_id, rollout_index) {
+                                        Some(files) => PendingReason::ParentDependency {
+                                            parent_id: parent_id.clone(),
+                                            files,
+                                            reason,
+                                        },
+                                        None => PendingReason::Retryable(reason),
+                                    }
                                 } else {
                                     PendingReason::MissingParent(parent_id.clone())
                                 };
@@ -1352,8 +1789,10 @@ fn sync_single_codex_file(
                                 modified: file_modified,
                                 size: file_size,
                                 prefix,
+                                parent_files: parent_files.unwrap_or_default(),
                             },
                         );
+                        trim_replay_caches(&mut caches);
                     }
                     prefix
                 }
@@ -1754,6 +2193,321 @@ mod tests {
             .collect::<Vec<_>>();
         let mut pass = CodexSyncPass::load(db)?;
         sync_single_codex_file(db, file, &build_rollout_index(&files), &mut pass)
+    }
+
+    fn append_jsonl(path: &Path, values: &[serde_json::Value]) -> u64 {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        let mut size = 0;
+        for value in values {
+            let bytes = format!("{}\n", serde_json::to_string(value).unwrap());
+            file.write_all(bytes.as_bytes()).unwrap();
+            size += bytes.len() as u64;
+        }
+        size
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn appended_codex_usage_reads_new_bytes_and_preserves_delta_model_and_event_identity(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+                serde_json::json!({"type":"response_item","payload":{"private":"x".repeat(2 * 1024 * 1024)}}),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let appended = append_jsonl(
+            &file,
+            &[
+                turn_context_for_model_at("gpt-new", "2026-07-10T03:00:01Z"),
+                token_count(250, 120, 25),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let cached = Arc::clone(&replay_caches().lock().unwrap().parsed_files[&file].parsed);
+        assert_eq!(cached.bytes_read, appended);
+        assert_eq!(cached.token_events[1].event_index, Some(2));
+        assert_eq!(cached.token_events[1].delta.input, 150);
+        assert_eq!(cached.token_events[1].model, "gpt-new");
+        let old_signature = cached.token_events[1].signature.clone();
+        clear_codex_replay_caches();
+        let cold = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        assert_eq!(cold.token_events.len(), cached.token_events.len());
+        assert_eq!(cold.token_events[1].signature, old_signature);
+        assert_eq!(
+            cold.token_events[1].delta.input,
+            cached.token_events[1].delta.input
+        );
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 0);
+        clear_codex_replay_caches();
+        append_jsonl(&file, &[token_count(350, 160, 35)]);
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let after_eviction =
+            Arc::clone(&replay_caches().lock().unwrap().parsed_files[&file].parsed);
+        assert_eq!(
+            after_eviction.bytes_read,
+            after_eviction.observed_bytes as u64
+        );
+        let conn = lock_conn!(db.conn);
+        let totals: (i64, i64, i64) = conn.query_row("SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens) FROM proxy_request_logs WHERE data_source='codex_session'", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        assert_eq!(totals, (3, 350, 35));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn incremental_codex_tail_retries_complete_unterminated_record_without_double_counting(
+    ) -> Result<(), AppError> {
+        use std::io::Write;
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        write_jsonl(&file, &[session_meta(PARENT_ID), turn_context()]);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(
+                serde_json::to_string(&token_count(100, 50, 10))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let first = Arc::clone(&replay_caches().lock().unwrap().parsed_files[&file].parsed);
+        assert_eq!(first.resume_events, 0);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        append_jsonl(&file, &[token_count(200, 100, 20)]);
+        assert_eq!(sync_test_file(&db, &file, &[&file])?.imported, 1);
+        let cached = Arc::clone(&replay_caches().lock().unwrap().parsed_files[&file].parsed);
+        assert!(cached.bytes_read < cached.observed_bytes as u64);
+        assert_eq!(cached.token_events.len(), 2);
+        assert_eq!(cached.token_events[1].event_index, Some(2));
+        assert_eq!(cached.token_events[1].delta.input, 100);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unchanged_parent_dependency_does_not_reparse_deferred_child_or_rewarn(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let parent = rollout_path(dir.path(), PARENT_ID);
+        let child = rollout_path(dir.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:10Z"),
+                turn_context(),
+                token_count(100, 50, 10),
+                token_count(250, 125, 25),
+            ],
+        );
+        let first = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(first.deferred && first.newly_deferred);
+        let cached = Arc::clone(&replay_caches().lock().unwrap().parsed_files[&child].parsed);
+        for _ in 0..3 {
+            let unchanged = sync_test_file(&db, &child, &[&parent, &child])?;
+            assert!(unchanged.deferred && !unchanged.newly_deferred);
+            assert!(Arc::ptr_eq(
+                &cached,
+                &replay_caches().lock().unwrap().parsed_files[&child].parsed
+            ));
+        }
+        append_jsonl(&parent, &[turn_context_at("2026-07-10T03:00:20Z")]);
+        let recovered = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(!recovered.deferred);
+        assert_eq!((recovered.imported, recovered.skipped), (1, 1));
+        assert!(Arc::ptr_eq(
+            &cached,
+            &replay_caches().lock().unwrap().parsed_files[&child].parsed
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parser_append_guard_falls_back_on_replacement_truncation_or_rewritten_head(
+    ) -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+            ],
+        );
+        let first = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(999, 400, 10),
+                token_count(1100, 500, 20),
+            ],
+        );
+        let rewritten = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        assert_eq!(rewritten.bytes_read, rewritten.observed_bytes as u64);
+        assert_eq!(rewritten.token_events[0].delta.input, 999);
+        write_jsonl(&file, &[session_meta(PARENT_ID), token_count(50, 25, 5)]);
+        let truncated = parse_codex_file(&file, thread_id_from_filename(&file))?;
+        assert_eq!(truncated.bytes_read, truncated.observed_bytes as u64);
+        assert_eq!(truncated.token_events.len(), 1);
+        assert!(first.observed_bytes > truncated.observed_bytes);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_parser_caches_have_entry_and_memory_budgets() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let dir = tempdir().unwrap();
+        let file = rollout_path(dir.path(), PARENT_ID);
+        write_jsonl(
+            &file,
+            &[
+                session_meta(PARENT_ID),
+                turn_context(),
+                token_count(100, 50, 10),
+            ],
+        );
+        let mut parsed = (*parse_codex_file(&file, thread_id_from_filename(&file))?).clone();
+        parsed.token_events[0].model = "x".repeat(1024 * 1024);
+        let parsed = Arc::new(parsed);
+        let stamp = ParentFileStamp::from_file(&fs::File::open(&file).unwrap()).unwrap();
+        let mut caches = CodexReplayCaches::default();
+        for i in 0..300 {
+            caches.parsed_files.insert(
+                PathBuf::from(format!("file-{i}")),
+                CachedParsedCodexFile {
+                    stamp,
+                    boundary_fingerprint: 0,
+                    parsed: Arc::clone(&parsed),
+                },
+            );
+        }
+        trim_replay_caches(&mut caches);
+        assert!(codex_cache_entry_count(&caches) <= CODEX_CACHE_ENTRY_LIMIT);
+        assert!(codex_cache_bytes(&caches) <= CODEX_CACHE_BYTE_LIMIT);
+        for i in 0..300 {
+            let path = PathBuf::from(format!("pending-{i}"));
+            caches.pending.insert(
+                path.clone(),
+                PendingEntry {
+                    modified: 0,
+                    size: 0,
+                    child_stamp: Some(stamp),
+                    reason: PendingReason::ParentDependency {
+                        parent_id: PARENT_ID.to_owned(),
+                        files: vec![(path.clone(), stamp)],
+                        reason: "pending".repeat(100),
+                    },
+                },
+            );
+            caches.replay_prefixes.insert(
+                path.clone(),
+                CachedReplayPrefix {
+                    modified: 0,
+                    size: 0,
+                    prefix: 0,
+                    parent_files: vec![(path, stamp)],
+                },
+            );
+        }
+        trim_replay_caches(&mut caches);
+        assert!(codex_cache_entry_count(&caches) <= CODEX_CACHE_ENTRY_LIMIT);
+        assert!(codex_cache_bytes(&caches) <= CODEX_CACHE_BYTE_LIMIT);
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn appended_fork_keeps_replay_prefix_and_matches_cold_usage() -> Result<(), AppError> {
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let dir = tempdir().unwrap();
+        let parent = rollout_path(dir.path(), PARENT_ID);
+        let child = rollout_path(dir.path(), CHILD_A_ID);
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+                turn_context_at("2026-07-10T03:00:10Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 1);
+        append_jsonl(
+            &child,
+            &[
+                token_count_at(200, 100, 20, "2026-07-10T03:00:08Z"),
+                token_count_at(350, 175, 35, "2026-07-10T03:00:09Z"),
+            ],
+        );
+        assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 1);
+        let warm = Arc::clone(&replay_caches().lock().unwrap().parsed_files[&child].parsed);
+        assert!(warm.bytes_read < warm.observed_bytes as u64);
+        clear_codex_replay_caches();
+        let cold = parse_codex_file(&child, thread_id_from_filename(&child))?;
+        let project = |parsed: &ParsedCodexFile| {
+            parsed
+                .token_events
+                .iter()
+                .map(|event| {
+                    (
+                        event.line_offset,
+                        event.event_index,
+                        event.delta.input,
+                        event.delta.cached_input,
+                        event.delta.output,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(project(&warm), project(&cold));
+        assert_eq!(sync_test_file(&db, &child, &[&parent, &child])?.imported, 0);
+        let conn = lock_conn!(db.conn);
+        let totals: (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens) FROM proxy_request_logs WHERE data_source='codex_session'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        assert_eq!(totals, (2, 250, 25));
+        Ok(())
     }
 
     fn assert_unchanged_codex_file_is_skipped(db: &Database, file: &Path) -> Result<(), AppError> {

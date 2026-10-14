@@ -34,6 +34,7 @@ mod proxy;
 mod services;
 mod session_manager;
 mod settings;
+pub mod startup_isolation;
 mod store;
 
 mod tray;
@@ -505,6 +506,7 @@ pub fn run() {
                 // 用户配置存在数据库中，数据库尚未打开时使用保守的 Info 级别。
                 log::set_max_level(log::LevelFilter::Info);
                 log::info!("=== CC Switch v{} started ===", env!("CARGO_PKG_VERSION"));
+                startup_isolation::log_startup_report();
             }
 
             // 首次读取覆盖路径时 logger 尚未可用；此处重放一次，
@@ -1285,25 +1287,27 @@ pub fn run() {
                         if !crate::settings::get_settings().session_auto_sync_enabled {
                             return;
                         }
-                        let _guard = crate::services::session_usage::session_sync_mutex()
-                            .lock()
-                            .await;
-                        let task = tauri::async_runtime::spawn_blocking(move || {
-                            if !crate::settings::get_settings().session_auto_sync_enabled {
-                                return crate::services::session_usage::SessionSyncResult::default();
+                        if backfill {
+                            // Startup maintenance is optional; do not queue it
+                            // behind a page import and trigger another scan.
+                            if let Ok(guard) = crate::services::session_usage::session_sync_mutex().try_lock() {
+                                let db_for_costs = db.clone();
+                                let task = tauri::async_runtime::spawn_blocking(move || {
+                                    let _guard = guard;
+                                    if crate::settings::get_settings().session_auto_sync_enabled {
+                                        if let Err(error) = db_for_costs.backfill_missing_usage_costs() {
+                                            log::warn!("Usage cost startup backfill failed: {error}");
+                                        }
+                                    }
+                                });
+                                let _ = task.await;
                             }
-                            if backfill {
-                                if let Err(error) = db.backfill_missing_usage_costs() {
-                                    log::warn!("Usage cost startup backfill failed: {error}");
-                                }
-                            }
-                            if !crate::settings::get_settings().session_auto_sync_enabled {
-                                return crate::services::session_usage::SessionSyncResult::default();
-                            }
-                            crate::services::session_usage::sync_all_unlocked(&db)
-                        });
-                        match task.await {
-                            Ok(result) if !result.errors.is_empty() => {
+                        }
+                        if !crate::settings::get_settings().session_auto_sync_enabled {
+                            return;
+                        }
+                        match crate::services::session_usage::sync_all_background(db).await {
+                            Ok(Some(result)) if !result.errors.is_empty() => {
                                 log::warn!(
                                     "Session usage sync completed with {} error(s)",
                                     result.errors.len()

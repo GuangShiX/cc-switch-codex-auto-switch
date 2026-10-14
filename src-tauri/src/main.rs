@@ -2,6 +2,11 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() {
+    // Hand off only a verified Codex-hosted Windows launch before any app,
+    // database, single-instance or automatic-switch worker is initialized.
+    if cc_switch_lib::startup_isolation::prepare_startup() {
+        return;
+    }
     // 在 Linux 上设置 WebKit 环境变量以解决 DMA-BUF 渲染问题
     // 某些 Linux 系统（如 Debian 13.2、Nvidia GPU）上 WebKitGTK 的 DMA-BUF 渲染器可能导致白屏/黑屏
     // 参考: https://github.com/tauri-apps/tauri/issues/9394

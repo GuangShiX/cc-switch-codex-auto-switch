@@ -1786,7 +1786,7 @@
     "rawInputLabel": "Raw",
     "sessionSync": {
       "title": "Auto-Scan Session Logs",
-      "description": "Sync session usage in the background every 5 minutes. When off, sync once on entering the usage page and every 5 minutes while it remains visible; hiding or leaving the page stops new scheduled imports.",
+      "description": "Usage updates once when you open this page, then at the refresh interval selected above. Turning scheduled refresh off still allows manual refresh. Hiding or leaving the page stops its scheduled updates. This switch separately enables background updates every 5 minutes.",
       "syncNow": "Sync Now",
       "syncCompleted": "Sync completed: {{imported}} imported, {{files}} files scanned, {{errors}} errors",
       "syncFailed": "Session usage sync failed: {{error}}",

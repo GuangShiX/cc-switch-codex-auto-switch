@@ -1266,8 +1266,12 @@ mod native {
             guard: &dyn Fn() -> Result<(), String>,
         ) -> Result<(), String> {
             super::ensure_no_shutdown_pending()?;
+            crate::startup_isolation::ensure_independent_for_desktop_shutdown()?;
             log::info!("Codex 正常退出准备：核对桌面进程及 Windows 退出资源");
             validate_restart_roots(desktops)?;
+            for desktop in desktops {
+                crate::startup_isolation::log_shutdown_context(desktop.pid, desktop.birth);
+            }
             if desktops.is_empty() || self::desktops()? != desktops {
                 return Err("原 Codex 桌面进程清单已变化；本次不会关闭其他进程".into());
             }

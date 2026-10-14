@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => nativeWindow,
 }));
 
-const FIVE_MINUTES = 300_000;
+const REFRESH_INTERVAL = 30_000;
 const result: SessionSyncResult = {
   imported: 12,
   skipped: 0,
@@ -48,8 +48,8 @@ function wrapper(client: QueryClient, strict = false) {
   };
 }
 
-function Probe({ background = false }: { background?: boolean }) {
-  const sync = useUsageSessionSync(background);
+function Probe({ interval = REFRESH_INTERVAL }: { interval?: number }) {
+  const sync = useUsageSessionSync(interval);
   const summary = useUsageSummaryByApp({ preset: "today" }, undefined, {
     refetchInterval: false,
   });
@@ -157,10 +157,10 @@ describe("usage page session imports", () => {
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
   });
 
-  it("limits page imports to five minutes even when database queries refresh faster", async () => {
+  it("imports new tokens at the selected 30-second refresh interval", async () => {
     render(<Probe />, { wrapper: wrapper(createClient()) });
     await settle();
-    await advance(FIVE_MINUTES - 1);
+    await advance(REFRESH_INTERVAL - 1);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
     await advance(1);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
@@ -168,7 +168,28 @@ describe("usage page session imports", () => {
     expect(screen.getByTestId("tokens")).toHaveTextContent("84");
   });
 
-  it("starts the five-minute cooldown after a long import finishes", async () => {
+  it("reschedules imports when the refresh dropdown interval changes", async () => {
+    const view = render(<Probe interval={60_000} />, {
+      wrapper: wrapper(createClient()),
+    });
+    await settle();
+    await advance(4_000);
+    view.rerender(<Probe interval={5_000} />);
+    await settle();
+    expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
+    await advance(1_000);
+    expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
+    await advance(1);
+    expect(screen.getByTestId("tokens")).toHaveTextContent("84");
+    view.rerender(<Probe interval={0} />);
+    await advance(60_000);
+    expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
+    view.rerender(<Probe interval={10_000} />);
+    await settle();
+    expect(api.syncSessionUsage).toHaveBeenCalledTimes(3);
+  });
+
+  it("starts the selected interval after a long import finishes without queuing scans", async () => {
     let finish!: (value: SessionSyncResult) => void;
     api.syncSessionUsage.mockImplementationOnce(
       () =>
@@ -187,7 +208,7 @@ describe("usage page session imports", () => {
       finish(result);
     });
     await settle();
-    await advance(FIVE_MINUTES - 1);
+    await advance(REFRESH_INTERVAL - 1);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
     await advance(2);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
@@ -196,14 +217,14 @@ describe("usage page session imports", () => {
   it("does not scan hidden pages or run queued catch-up scans when visible again", async () => {
     render(<Probe />, { wrapper: wrapper(createClient()) });
     await settle();
-    await advance(60_000);
+    await advance(10_000);
     visibility("hidden");
     await advance(20 * 60_000);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
     visibility("visible");
     await settle();
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
-    await advance(FIVE_MINUTES);
+    await advance(REFRESH_INTERVAL);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
   });
 
@@ -215,7 +236,7 @@ describe("usage page session imports", () => {
     visibility("visible");
     await settle();
     expect(api.syncSessionUsage).not.toHaveBeenCalled();
-    await advance(FIVE_MINUTES);
+    await advance(REFRESH_INTERVAL);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
   });
 
@@ -225,10 +246,10 @@ describe("usage page session imports", () => {
     await settle();
     await advance(20 * 60_000);
     expect(api.syncSessionUsage).not.toHaveBeenCalled();
-    expect(nativeWindow.isVisible).toHaveBeenCalledTimes(5);
-    expect(nativeWindow.isMinimized).toHaveBeenCalledTimes(5);
+    expect(nativeWindow.isVisible).toHaveBeenCalledTimes(41);
+    expect(nativeWindow.isMinimized).toHaveBeenCalledTimes(41);
     nativeWindow.isVisible.mockResolvedValue(true);
-    await advance(FIVE_MINUTES);
+    await advance(REFRESH_INTERVAL);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
   });
 
@@ -236,7 +257,7 @@ describe("usage page session imports", () => {
     nativeWindow.isMinimized.mockResolvedValue(true);
     render(<Probe />, { wrapper: wrapper(createClient()) });
     await settle();
-    await advance(FIVE_MINUTES);
+    await advance(REFRESH_INTERVAL);
     expect(api.syncSessionUsage).not.toHaveBeenCalled();
     expect(nativeWindow.isVisible).toHaveBeenCalledTimes(2);
   });
@@ -285,7 +306,7 @@ describe("usage page session imports", () => {
     });
     await settle();
     expect(api.syncSessionUsage).not.toHaveBeenCalled();
-    await advance(FIVE_MINUTES);
+    await advance(REFRESH_INTERVAL);
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(1);
   });
 
@@ -316,8 +337,8 @@ describe("usage page session imports", () => {
     expect(api.syncSessionUsage).toHaveBeenCalledTimes(2);
   });
 
-  it("does not add page polling when native background sync is enabled; manual refresh remains available", async () => {
-    render(<Probe background />, { wrapper: wrapper(createClient()) });
+  it("turns off scheduled imports at interval zero while entry and manual refresh remain usable", async () => {
+    render(<Probe interval={0} />, { wrapper: wrapper(createClient()) });
     await settle();
     await advance(20 * 60_000);
     act(() => window.dispatchEvent(new Event("focus")));

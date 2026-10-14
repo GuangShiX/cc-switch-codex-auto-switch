@@ -251,15 +251,7 @@ pub fn delete_model_pricing(state: State<'_, AppState>, model_id: String) -> Res
 pub async fn sync_session_usage(
     state: State<'_, AppState>,
 ) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
-    let db = state.db.clone();
-    let _guard = crate::services::session_usage::session_sync_mutex()
-        .lock()
-        .await;
-    tauri::async_runtime::spawn_blocking(move || {
-        crate::services::session_usage::sync_all_unlocked(&db)
-    })
-    .await
-    .map_err(|error| AppError::Message(format!("会话用量同步任务失败: {error}")))
+    crate::services::session_usage::sync_all_coalesced(state.db.clone()).await
 }
 
 /// Codex reset 成功后，无论重导是否导入新行或返回错误，都必须通知前端刷新。
@@ -278,10 +270,11 @@ pub async fn rebuild_codex_usage(
     state: State<'_, AppState>,
 ) -> Result<crate::services::session_usage::SessionSyncResult, AppError> {
     let db = state.db.clone();
-    let _guard = crate::services::session_usage::session_sync_mutex()
+    let guard = crate::services::session_usage::session_sync_mutex()
         .lock()
         .await;
     tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
         db.backup_database_file()?;
         db.reset_codex_usage()?;
         let result = crate::services::session_usage_codex::sync_codex_usage(&db);

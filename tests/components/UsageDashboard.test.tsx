@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -7,7 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import type { ComponentProps } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UsageDashboard } from "@/components/usage/UsageDashboard";
 
 const useProviderStatsMock = vi.hoisted(() => vi.fn());
@@ -147,6 +148,44 @@ describe("UsageDashboard", () => {
     });
     useProviderStatsMock.mockReturnValue({ data: [] });
     useModelStatsMock.mockReturnValue({ data: [] });
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it.each([5_000, 30_000, 60_000])(
+    "imports sessions at the saved %i ms panel interval even with background sync enabled",
+    async (interval) => {
+      vi.useFakeTimers();
+      renderDashboard({
+        refreshIntervalMs: interval,
+        sessionAutoSyncEnabled: true,
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(syncSessionUsageMock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(interval - 1);
+      });
+      expect(syncSessionUsageMock).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(syncSessionUsageMock).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("imports once on entry but stops scheduled imports when the saved interval is off", async () => {
+    vi.useFakeTimers();
+    renderDashboard({ refreshIntervalMs: 0 });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(syncSessionUsageMock).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300_000);
+    });
+    expect(syncSessionUsageMock).toHaveBeenCalledTimes(1);
   });
 
   it("uses the saved refresh interval when mounted", () => {
